@@ -14,6 +14,7 @@ export type ModuleId =
   | "mcp"
   | "logs"
   | "models"
+  | "proxy"
   | "settings";
 
 export type View = { kind: "session" } | { kind: "module"; id: ModuleId };
@@ -40,5 +41,6 @@ export const MODULES: ModuleDef[] = [
   { id: "mcp", label: "MCP", icon: "plug", desc: "服务与工具接入状态", group: "配置" },
   { id: "logs", label: "日志", icon: "file", desc: "引擎、MCP 与启动日志", group: "配置" },
   { id: "models", label: "模型", icon: "cpu", desc: "自定义模型与 API 端点", group: "配置" },
+  { id: "proxy", label: "代理", icon: "globe", desc: "上传代理配置、AI 解析、池与测活", group: "配置" },
   { id: "settings", label: "设置", icon: "settings", desc: "引擎、路径与原生入口", group: "配置" },
 ];

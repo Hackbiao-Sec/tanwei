@@ -22,6 +22,7 @@ import type {
   NetworkStatus,
   PermissionMode,
   ProxyFreeResult,
+  ProxyAiResult,
   ProxyImportResult,
   ProxyPool,
   RendererEvent,
@@ -125,7 +126,12 @@ const api = {
   pool: (): Promise<ProxyPool> => ipcRenderer.invoke("pool:get"),
   poolPath: (): Promise<string> => ipcRenderer.invoke("pool:path"),
   importPoolFile: (): Promise<ProxyImportResult | undefined> => ipcRenderer.invoke("pool:import-file"),
+  pickPoolFile: (): Promise<string | undefined> => ipcRenderer.invoke("pool:pick-file"),
   importPoolText: (text: string): Promise<ProxyImportResult> => ipcRenderer.invoke("pool:import-text", text),
+  importPoolPath: (input: { file?: string; text?: string }): Promise<ProxyImportResult> =>
+    ipcRenderer.invoke("pool:import-path", input),
+  aiParseProxy: (input: { file?: string; text?: string }): Promise<ProxyAiResult> =>
+    ipcRenderer.invoke("pool:ai-parse", input),
   addProxy: (url: string, label?: string): Promise<ProxyPool> => ipcRenderer.invoke("pool:add", { url, label }),
   removeProxies: (ids: string[]): Promise<ProxyPool> => ipcRenderer.invoke("pool:remove", ids),
   enableProxy: (id: string, enabled: boolean): Promise<ProxyPool> =>

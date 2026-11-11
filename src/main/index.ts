@@ -54,6 +54,7 @@ import {
 import { readSettings, writeSettings } from "./appSettings";
 import { deleteMcpServer, readMcpConfig, saveMcpServer } from "./mcpConfig";
 import { probeModel } from "./modelProbe";
+import { aiParseProxy } from "./proxyAi";
 import { sessionTaskNames } from "./history";
 import type {
   BootstrapInfo,
@@ -536,6 +537,38 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("pool:import-text", (_e, text: string) => importProxyText(String(text ?? "")));
+
+  ipcMain.handle("pool:pick-file", async () => {
+    const res = await dialog.showOpenDialog(win!, {
+      title: "选代理配置文件",
+      properties: ["openFile"],
+      filters: [
+        { name: "代理配置", extensions: ["txt", "json", "csv", "conf", "yaml", "yml", "ini", "list"] },
+        { name: "全部文件", extensions: ["*"] },
+      ],
+    });
+    return res.canceled ? undefined : res.filePaths[0];
+  });
+
+  // 前端拖进来 / 手填路径的文件，不走系统对话框
+  ipcMain.handle("pool:import-path", async (_e, input: { file?: string; text?: string }) => {
+    const file = String(input?.file ?? "").trim();
+    if (file) {
+      if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new Error(`文件不存在：${file}`);
+      const result = importProxyFile(file);
+      log(`proxy pool import path: ${path.basename(file)} +${result.added} skip ${result.skipped}`);
+      return result;
+    }
+    return importProxyText(String(input?.text ?? ""));
+  });
+
+  ipcMain.handle("pool:ai-parse", async (_e, input: { file?: string; text?: string }) => {
+    const file = String(input?.file ?? "").trim();
+    if (file && (!fs.existsSync(file) || !fs.statSync(file).isFile())) throw new Error(`文件不存在：${file}`);
+    const result = await aiParseProxy({ file: file || undefined, text: file ? undefined : String(input?.text ?? "") });
+    log(`proxy pool ai parse: ${file ? path.basename(file) : "paste"} +${result.added} via ${result.model}`);
+    return result;
+  });
 
   ipcMain.handle("pool:add", (_e, input: { url: string; label?: string }) =>
     addProxy(String(input?.url ?? ""), input?.label),

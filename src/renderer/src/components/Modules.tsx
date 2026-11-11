@@ -7,7 +7,6 @@ import type {
   EndpointProbe,
   EngineStatus,
   NetworkStatus,
-  ProxyEntry,
   ProxyMode,
   ProxyPool,
   McpServerInfo,
@@ -22,6 +21,7 @@ import { MODULES } from "../view";
 import { Icon } from "./Icons";
 import { McpPanel } from "./McpPanel";
 import { ModelsPanel } from "./ModelsPanel";
+import { ProxyPool as ProxyPoolPanel } from "./ProxyPool";
 import { Dashboard } from "./Dashboard";
 import { Findings } from "./Findings";
 import { Graph } from "./Graph";
@@ -65,18 +65,12 @@ const PROXY_MODES: { id: ProxyMode; label: string; hint: string }[] = [
   { id: "off", label: "不使用", hint: "全部直连" },
 ];
 
-const HEALTH_LABEL: Record<string, string> = { ok: "可用", bad: "不通", unknown: "未测" };
-const SOURCE_LABEL: Record<string, string> = { config: "导入", free: "免费", manual: "手填" };
 
 const CHROME_MODES: { id: ChromeMode; label: string; hint: string }[] = [
   { id: "hidden", label: "隐藏", hint: "真 Chrome 放屏幕外" },
   { id: "headless", label: "无头", hint: "不建窗口，更省内存" },
   { id: "visible", label: "显示", hint: "像以前那样弹窗" },
 ];
-
-function poolHealth(entry: ProxyEntry): string {
-  return HEALTH_LABEL[entry.health] ?? "未测";
-}
 
 export function ModulePage({
   id,
@@ -134,12 +128,6 @@ export function ModulePage({
   const [probe, setProbe] = useState<EndpointProbe>();
   const [probeBusy, setProbeBusy] = useState(false);
   const [pool, setPool] = useState<ProxyPool>();
-  const [poolBusy, setPoolBusy] = useState<string>();
-  const [poolNotice, setPoolNotice] = useState<string>();
-  const [poolError, setPoolError] = useState<string>();
-  const [poolText, setPoolText] = useState("");
-  const [poolOnlyOk, setPoolOnlyOk] = useState(false);
-  const [clearArmed, setClearArmed] = useState(false);
   const [browser, setBrowser] = useState<BrowserSettings>();
   const [browserBusy, setBrowserBusy] = useState(false);
   const [browserNotice, setBrowserNotice] = useState<string>();
@@ -210,89 +198,6 @@ export function ModulePage({
       setProbeBusy(false);
     }
   };
-
-  const poolTask = async (key: string, fn: () => Promise<void>) => {
-    setPoolBusy(key);
-    setPoolError(undefined);
-    setPoolNotice(undefined);
-    try {
-      await fn();
-    } catch (err) {
-      setPoolError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPoolBusy(undefined);
-    }
-  };
-
-  const importPoolFile = () =>
-    poolTask("import", async () => {
-      const res = await window.tanwei.importPoolFile();
-      if (!res) return;
-      setPool(res.pool);
-      setPoolNotice(
-        res.added
-          ? `从配置文件导入 ${res.added} 条代理${res.skipped ? `，${res.skipped} 行没认出` : ""}`
-          : `没有新代理，这份文件里的 ${res.pool.entries.length} 条已经在池里`,
-      );
-    });
-
-  const importPoolText = () =>
-    poolTask("paste", async () => {
-      const res = await window.tanwei.importPoolText(poolText);
-      setPool(res.pool);
-      setPoolText("");
-      setPoolNotice(
-        res.added
-          ? `粘贴导入 ${res.added} 条代理${res.skipped ? `，${res.skipped} 行没认出` : ""}`
-          : "这些代理池里已经有了",
-      );
-    });
-
-  const fetchFree = () =>
-    poolTask("free", async () => {
-      const res = await window.tanwei.fetchFreeProxies(80);
-      setPool(res.pool);
-      setPoolNotice(
-        res.added
-          ? `公开源抓到 ${res.fetched} 条，新入库 ${res.added} 条`
-          : `公开源抓到 ${res.fetched} 条，池里都已经有了`,
-      );
-    });
-
-  const testPool = () =>
-    poolTask("test", async () => {
-      const next = await window.tanwei.testProxies();
-      setPool(next);
-      const ok = next.entries.filter((e) => e.health === "ok").length;
-      setPoolNotice(`测活完成：${ok} 条可用 / 池里共 ${next.entries.length} 条`);
-    });
-
-  const toggleEntry = (entry: ProxyEntry) =>
-    poolTask(`entry-${entry.id}`, async () => {
-      setPool(await window.tanwei.enableProxy(entry.id, !entry.enabled));
-    });
-
-  const pickEntry = (entry: ProxyEntry) =>
-    poolTask(`entry-${entry.id}`, async () => {
-      setPool(await window.tanwei.setPoolActive(entry.id));
-    });
-
-  const dropEntry = (entry: ProxyEntry) =>
-    poolTask(`entry-${entry.id}`, async () => {
-      setPool(await window.tanwei.removeProxies([entry.id]));
-    });
-
-  const toggleRotate = () =>
-    poolTask("rotate", async () => {
-      setPool(await window.tanwei.setPoolRotate(!pool?.rotate));
-    });
-
-  const clearPool = () =>
-    poolTask("clear", async () => {
-      setPool(await window.tanwei.clearPool());
-      setPoolNotice("代理池已清空");
-      setClearArmed(false);
-    });
 
   const installFolder = async () => {
     setInstallBusy(true);
@@ -416,10 +321,6 @@ export function ModulePage({
   };
 
   const poolOk = (pool?.entries ?? []).filter((e) => e.health === "ok").length;
-  const poolEnabled = (pool?.entries ?? []).filter((e) => e.enabled).length;
-  const poolShown = (pool?.entries ?? []).filter((e) => (poolOnlyOk ? e.health === "ok" : true));
-  const poolRows = poolShown.slice(0, 300);
-
   return (
     <div className="module-page">
       {!SELF_HEADED.includes(id) ? (
@@ -452,6 +353,7 @@ export function ModulePage({
       {error ? <div className="module-error">{error}</div> : null}
 
       {id === "models" ? <ModelsPanel boot={boot} /> : null}
+      {id === "proxy" ? <ProxyPoolPanel /> : null}
       {body()}
       {id === "findings" ? <Findings onAsk={onAsk} sessionTasks={sessionTasks} activeId={activeId} /> : null}
       {id === "tasks" ? (
@@ -797,123 +699,14 @@ export function ModulePage({
               </span>
             </div>
             <div className="card-note">
-              付费代理配置文件和公开免费源都能进池。上面模式选「代理池」后，引擎冷启动会取池里选中的那条；勾了轮换就换下一条。测活打 http://www.gstatic.com/generate_204，只影响池里的状态。
+              上传配置文件、AI 解析陌生格式、测活和池子管理都挪到「代理」模块了。这里选「代理池」模式后，引擎冷启动就会取池里选中的那条。
             </div>
-            <div className="pool-actions">
-              <button className="btn sm" onClick={() => void importPoolFile()} disabled={!!poolBusy}>
-                <Icon name="file" size={12} />
-                <span>{poolBusy === "import" ? "导入中…" : "导入配置文件"}</span>
+            <div className="card-actions">
+              <button className="btn sm" onClick={() => onModule("proxy")}>
+                <Icon name="globe" size={12} />
+                <span>打开代理模块</span>
               </button>
-              <button className="btn ghost sm" onClick={() => void fetchFree()} disabled={!!poolBusy}>
-                <Icon name="bolt" size={12} />
-                <span>{poolBusy === "free" ? "抓取中…" : "自动找免费代理"}</span>
-              </button>
-              <button className="btn ghost sm" onClick={() => void testPool()} disabled={!!poolBusy}>
-                <Icon name="refresh" size={12} />
-                <span>{poolBusy === "test" ? "测活中…" : "测活"}</span>
-              </button>
-              <label className="pool-rotate">
-                <input
-                  type="checkbox"
-                  checked={!!pool?.rotate}
-                  disabled={!!poolBusy}
-                  onChange={() => void toggleRotate()}
-                />
-                <span>冷启动时轮换</span>
-              </label>
             </div>
-            <textarea
-              className="pool-text mono"
-              placeholder={"也能直接粘贴，一行一条：\nhttp://user:pass@1.2.3.4:8080\n1.2.3.4:1080\nsocks5://1.2.3.4:1080:user:pass"}
-              value={poolText}
-              onChange={(e) => setPoolText(e.target.value)}
-              spellCheck={false}
-            />
-            <div className="pool-actions">
-              <button
-                className="btn ghost sm"
-                onClick={() => void importPoolText()}
-                disabled={!!poolBusy || !poolText.trim()}
-              >
-                <Icon name="plus" size={12} />
-                <span>粘贴导入</span>
-              </button>
-              <label className="pool-rotate">
-                <input
-                  type="checkbox"
-                  checked={poolOnlyOk}
-                  onChange={(e) => setPoolOnlyOk(e.target.checked)}
-                />
-                <span>只看可用</span>
-              </label>
-              <span className="pool-stats">
-                启用 {poolEnabled} 条 · 当前 {pool?.activeId ? "已选中" : "自动挑选"}
-              </span>
-              {pool?.entries.length ? (
-                <button
-                  className="btn danger sm"
-                  onClick={() => {
-                    if (!clearArmed) {
-                      setClearArmed(true);
-                      return;
-                    }
-                    void clearPool();
-                  }}
-                  disabled={!!poolBusy}
-                >
-                  <Icon name="close" size={12} />
-                  <span>{poolBusy === "clear" ? "清空中…" : clearArmed ? "确认清空" : "清空"}</span>
-                </button>
-              ) : null}
-            </div>
-            {poolNotice ? <div className="card-note">{poolNotice}</div> : null}
-            {poolError ? <div className="card-note pool-error">{poolError}</div> : null}
-            {pool && pool.entries.length ? (
-              <div className="pool-list">
-                {poolRows.map((entry) => (
-                  <div className={`pool-row${entry.enabled ? "" : " is-off"}`} key={entry.id}>
-                    <span className={`pool-health h-${entry.health}`}>{poolHealth(entry)}</span>
-                    <span className="pool-url mono" title={entry.label || entry.url}>
-                      {entry.url.replace(/\/\/[^@/]+@/, "//***@")}
-                    </span>
-                    <span className="pool-src">{SOURCE_LABEL[entry.source] ?? entry.source}</span>
-                    {entry.latencyMs ? <span className="pool-ms mono">{entry.latencyMs}ms</span> : null}
-                    {pool.activeId === entry.id ? <span className="chip chip-on">当前</span> : null}
-                    <span className="pool-row-actions">
-                      <button
-                        className="pool-mini"
-                        onClick={() => void toggleEntry(entry)}
-                        disabled={!!poolBusy}
-                      >
-                        {entry.enabled ? "停用" : "启用"}
-                      </button>
-                      <button
-                        className="pool-mini"
-                        onClick={() => void pickEntry(entry)}
-                        disabled={!!poolBusy}
-                      >
-                        选它
-                      </button>
-                      <button
-                        className="pool-mini danger"
-                        onClick={() => void dropEntry(entry)}
-                        disabled={!!poolBusy}
-                      >
-                        删除
-                      </button>
-                    </span>
-                  </div>
-                ))}
-                {poolShown.length > poolRows.length ? (
-                  <div className="card-note">只显示前 {poolRows.length} 条，池里还有 {poolShown.length - poolRows.length} 条。</div>
-                ) : null}
-                {!poolShown.length ? <div className="card-note">没有可用代理，先测活或者换批源。</div> : null}
-              </div>
-            ) : (
-              <div className="card-note">
-                池是空的。导入你的付费代理配置文件，或者点「自动找免费代理」抓一批公开源。
-              </div>
-            )}
           </div>
 
           <div className="card">

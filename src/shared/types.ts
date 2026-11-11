@@ -438,6 +438,29 @@ export interface ProxyPool {
   updatedAt?: number;
 }
 
+/** 配置里声明的本机客户端端口（Clash 的 mixed-port 之类），本身就是一个可拨的出口 */
+export interface ProxyLocalPort {
+  port: number;
+  /** 该端口认的协议：mixed 两种都认，http / socks5 只认一种 */
+  scheme: string;
+  /** 配置里的原始键，例如 mixed-port */
+  key: string;
+}
+
+/** 一份代理配置解析出来长什么样，用来在界面上说清「认出了什么、哪些用不了」 */
+export interface ProxyImportStats {
+  /** 判定出的文件类型：clash / json / list / base64 / ai / unknown */
+  kind: string;
+  /** 能直接拨的协议计数，键是 http/https/socks4/socks5 */
+  usable: Record<string, number>;
+  /** 需要本机客户端转发的节点协议计数，键是 ss/vmess/trojan 等 */
+  nodes: Record<string, number>;
+  /** 配置里读到的本机客户端端口，例如 Clash 的 mixed-port */
+  localPorts: ProxyLocalPort[];
+  /** 给界面看的提示，例如「ss 节点要走本机 Clash」 */
+  notes: string[];
+}
+
 export interface ProxyImportResult {
   pool: ProxyPool;
   added: number;
@@ -446,6 +469,17 @@ export interface ProxyImportResult {
   /** 解析到但格式不认识的行数 */
   skipped: number;
   source: string;
+  stats: ProxyImportStats;
+}
+
+/** 让 AI 从没见过的格式里抽代理，返回它到底做了什么 */
+export interface ProxyAiResult extends ProxyImportResult {
+  /** 实际用的模型 ID */
+  model: string;
+  /** 模型自己的说明，例如「抽出 12 条，另有 30 个 ss 节点无法直连」 */
+  note: string;
+  /** 模型原始输出，抽不出结构化结果时给界面兜底展示 */
+  raw?: string;
 }
 
 export interface ProxyFreeResult {

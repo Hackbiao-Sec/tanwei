@@ -1,10 +1,13 @@
 import { app, net, session } from "electron";
 import fs from "node:fs";
 import path from "node:path";
+import { probeCredentialedProxy } from "./proxyProbe";
 import type {
   ProxyEntry,
   ProxyFreeResult,
   ProxyImportResult,
+  ProxyImportStats,
+  ProxyLocalPort,
   ProxyPool,
   ProxySource,
 } from "../shared/types";
@@ -16,8 +19,16 @@ import type {
 
 const MAX_ENTRIES = 3000;
 const MAX_IMPORT_BYTES = 6 * 1024 * 1024;
-/** 测活走 204，任何 2xx/3xx 都算这条代理能用 */
-const HEALTH_URL = "http://www.gstatic.com/generate_204";
+/** 测活走 204，任何 2xx/3xx 都算这条代理能用；付费节点偶发 502 时换第二个地址再判一次 */
+const HEALTH_URLS = ["http://www.gstatic.com/generate_204", "https://www.cloudflare.com/cdn-cgi/trace"];
+/** 代理本身通了、只是上游那一段挂了，才值得换地址重试 */
+const UPSTREAM_FAIL = /ERR_TUNNEL_CONNECTION_FAILED|ERR_EMPTY_RESPONSE|ERR_INCOMPLETE_CHUNKED_ENCODING|ERR_CONNECTION_CLOSED|ERR_CONNECTION_RESET/;
+/**
+ * Chromium 不给用带账号密码的代理：规则里塞 userinfo 会被判成无效规则，
+ * Electron 的 app「login」事件在 net.request 上也不触发。这类条目交给 socket 探针。
+ */
+const WITH_CREDENTIALS = /^[a-z0-9]+:\/\/[^/@]+@/i;
+
 const HEALTH_TIMEOUT_MS = 7_000;
 const HEALTH_SLOTS = 6;
 /** 一次「测活」最多测这么多条，免费源整批入库时几千条测不完 */
@@ -145,7 +156,7 @@ function stripComment(line: string): string {
   return line.replace(/\s#.*$/, "").replace(/\s\/\/.*$/, "").replace(/^\s*#.*$/, "").replace(/^\s*\/\/.*$/, "");
 }
 
-interface ParsedToken {
+export interface ParsedToken {
   url: string;
   label?: string;
 }
@@ -168,64 +179,292 @@ function tryBase64Text(body: string): string | undefined {
   }
 }
 
-/** Clash / mihomo 订阅：只要 server + port 这两行，同块的 type/username/password 当配料 */
-function parseYamlProxies(
-  body: string,
-  defaultScheme: "http" | "socks5",
-  push: (url: string, label?: string) => void,
-  onSkip: () => void,
-): number {
-  let hits = 0;
-  let block: { server?: string; port?: string; type?: string; user?: string; pass?: string } | null = null;
-  const flush = () => {
-    if (!block) return;
-    const { server, port } = block;
-    if (server && port && hostOk(server) && portOk(port)) {
-      const rawType = (block.type ?? "").toLowerCase();
-      const scheme = rawType.includes("socks5")
-        ? "socks5"
-        : rawType.includes("socks4")
-          ? "socks4"
-          : rawType.includes("http")
-            ? "http"
-            : defaultScheme;
-      const creds = block.user
-        ? `${encodeURIComponent(block.user)}${block.pass ? `:${encodeURIComponent(block.pass)}` : ""}@`
-        : "";
-      const url = normalizeProxyUrl(`${scheme}://${creds}${server}:${port}`);
-      if (url) {
-        push(url);
-        hits += 1;
-      } else onSkip();
-    }
-    block = null;
-  };
-  for (const rawLine of body.split(/\r?\n/)) {
-    const line = stripComment(rawLine.replace(/\t/g, " ")).trimEnd();
-    if (!line.trim()) continue;
-    const newItem = /^\s*-\s/.test(line);
-    if (newItem) flush();
-    const clean = line.replace(/^\s*-\s*/, "").trim();
-    const match = clean.match(/^([A-Za-z_]+)\s*:\s*(.+)$/);
-    if (!match) continue;
-    const key = match[1].toLowerCase();
-    const value = match[2].trim().replace(/^["']|["']$/g, "");
-    if (!["server", "port", "type", "username", "password", "protocol", "user", "pass"].includes(key)) continue;
-    block = block ?? {};
-    if (key === "server") block.server = value;
-    else if (key === "port") block.port = value;
-    else if (key === "type" || key === "protocol") block.type = value;
-    else if (key === "username" || key === "user") block.user = value;
-    else if (key === "password" || key === "pass") block.pass = value;
-  }
-  flush();
-  return hits;
+/** Clash/mihomo 节点协议里，Electron 的 net 自己就能拨的几种 */
+const DIAL_TYPES: Record<string, string> = {
+  http: "http",
+  https: "https",
+  socks: "socks5",
+  socks5: "socks5",
+  socks4: "socks4",
+};
+
+interface NodeDraft {
+  type?: string;
+  name?: string;
+  server?: string;
+  port?: string;
+  user?: string;
+  pass?: string;
 }
 
-export function parseProxyText(text: string, defaultScheme: "http" | "socks5" = "http"): {
+interface ClashScan {
   tokens: ParsedToken[];
-  skipped: number;
-} {
+  usable: Record<string, number>;
+  nodes: Record<string, number>;
+  localPorts: ProxyLocalPort[];
+  notes: string[];
+  /** 命中过 proxies 块或本机端口，说明这确实是一份客户端配置 */
+  structured: boolean;
+}
+
+/** 去掉行尾注释；引号里的 # 不当注释（ss 的 password 里可能就有） */
+function stripYamlComment(line: string): string {
+  let out = "";
+  let quote = "";
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i];
+    if (quote) {
+      out += ch;
+      if (ch === quote && line[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if (ch === "#" && (i === 0 || /\s/.test(line[i - 1]))) return out;
+    out += ch;
+  }
+  return out;
+}
+
+/** 按顶层逗号切 flow 内容；{} [] 里的逗号、引号里的逗号都不切 */
+function splitFlow(body: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  let quote = "";
+  let depth = 0;
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (quote) {
+      cur += ch;
+      if (ch === quote && body[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "{" || ch === "[") {
+      depth += 1;
+      cur += ch;
+      continue;
+    }
+    if (ch === "}" || ch === "]") {
+      depth -= 1;
+      cur += ch;
+      continue;
+    }
+    if (ch === "," && depth <= 0) {
+      parts.push(cur);
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur);
+  return parts;
+}
+
+/** 括号开合度：内联 map / 数组跨行写的时候靠它判断有没有写完 */
+function flowBalance(text: string): number {
+  let depth = 0;
+  let quote = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote && text[i - 1] !== "\\") quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{" || ch === "[") depth += 1;
+    else if (ch === "}" || ch === "]") depth -= 1;
+  }
+  return depth;
+}
+
+function unquoteYaml(raw: string): string {
+  const value = raw.trim();
+  const paired =
+    value.length >= 2 &&
+    ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")));
+  return paired ? value.slice(1, -1).replace(/\\(["'\\])/g, "$1") : value;
+}
+
+function applyNodeField(draft: NodeDraft, rawKey: string, value: string): void {
+  const key = rawKey.toLowerCase();
+  if (key === "name") draft.name = value;
+  else if (key === "type" || key === "protocol") draft.type = value;
+  else if (key === "server" || key === "host" || key === "address") draft.server = value;
+  else if (key === "port") draft.port = value;
+  else if (key === "username" || key === "user") draft.user = draft.user ?? value;
+  else if (key === "password" || key === "pass" || key === "pwd") draft.pass = draft.pass ?? value;
+}
+
+/**
+ * Clash / mihomo 订阅：两种写法都认——单行内联 map（`- { name: …, type: ss, … }`）和块式。
+ * 能拨的 http/socks 转成池里的地址；ss/vmess/trojan 这些 Electron 拨不了，
+ * 记进清单，交给本机 Clash 已经在跑的 mixed-port 当出口。
+ */
+function scanClashConfig(body: string): ClashScan {
+  const scan: ClashScan = { tokens: [], usable: {}, nodes: {}, localPorts: [], notes: [], structured: false };
+  const seen = new Set<string>();
+  let draft: NodeDraft | null = null;
+  let inProxies = false;
+  let flow = "";
+  let flowArray = false;
+
+  const finish = () => {
+    if (!draft) return;
+    const node = draft;
+    draft = null;
+    const server = (node.server ?? "").trim();
+    const port = (node.port ?? "").trim();
+    if (!hostOk(server) || !portOk(port)) return;
+    const type = (node.type ?? "").toLowerCase();
+    const scheme = DIAL_TYPES[type] ?? "";
+    if (!scheme) {
+      const key = type || "unknown";
+      scan.nodes[key] = (scan.nodes[key] ?? 0) + 1;
+      return;
+    }
+    const creds = node.user
+      ? `${encodeURIComponent(node.user)}${node.pass ? `:${encodeURIComponent(node.pass)}` : ""}@`
+      : "";
+    const url = normalizeProxyUrl(`${scheme}://${creds}${server}:${port}`);
+    if (!url || seen.has(url)) return;
+    seen.add(url);
+    scan.tokens.push({ url, label: node.name || undefined });
+    scan.usable[scheme] = (scan.usable[scheme] ?? 0) + 1;
+  };
+
+  const absorb = (text: string) => {
+    const inner = text.trim().replace(/^\{/, "").replace(/\}$/, "");
+    draft = draft ?? {};
+    for (const pair of splitFlow(inner)) {
+      const match = pair.match(/^\s*([A-Za-z0-9_-]+)\s*:\s*([\s\S]+?)\s*$/);
+      if (!match) continue;
+      applyNodeField(draft, match[1], unquoteYaml(match[2]));
+    }
+  };
+
+  const absorbArray = (text: string) => {
+    const inner = text.trim().replace(/^\[/, "").replace(/\]$/, "");
+    for (const chunk of splitFlow(inner)) {
+      if (!chunk.trim()) continue;
+      draft = {};
+      absorb(chunk);
+      finish();
+    }
+  };
+
+  for (const rawLine of body.split(/\r?\n/)) {
+    const line = stripYamlComment(rawLine.replace(/\t/g, "  "));
+    if (!line.trim()) continue;
+    const indent = line.match(/^ */)?.[0].length ?? 0;
+
+    if (flow) {
+      const merged = `${flow} ${line.trim()}`;
+      if (flowBalance(merged) > 0) {
+        flow = merged;
+        continue;
+      }
+      flow = "";
+      if (flowArray) {
+        absorbArray(merged);
+      } else {
+        draft = {};
+        absorb(merged);
+        finish();
+      }
+      continue;
+    }
+
+    const top = line.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
+    if (indent === 0 && top) {
+      const key = top[1].toLowerCase();
+      const value = top[2].trim();
+      finish();
+      inProxies = key === "proxies" && !value;
+      if (inProxies || key === "proxy-providers") scan.structured = true;
+      if (key === "proxies" && value.startsWith("[")) {
+        if (flowBalance(value) > 0) {
+          flow = value;
+          flowArray = true;
+        } else {
+          absorbArray(value);
+        }
+      }
+      if (["mixed-port", "port", "socks-port", "http-port"].includes(key)) {
+        const port = Number(unquoteYaml(value));
+        if (Number.isInteger(port) && port > 0 && port <= 65535) {
+          scan.localPorts.push({ port, scheme: key === "socks-port" ? "socks5" : "http", key });
+          scan.structured = true;
+        }
+      }
+      continue;
+    }
+
+    if (!inProxies) continue;
+
+    const trimmed = line.trim();
+    if (trimmed.startsWith("-")) {
+      finish();
+      const rest = trimmed.replace(/^-\s*/, "");
+      if (!rest) {
+        draft = {};
+        continue;
+      }
+      if (rest.startsWith("{")) {
+        if (flowBalance(rest) > 0) {
+          flow = rest;
+          flowArray = false;
+        } else {
+          draft = {};
+          absorb(rest);
+          finish();
+        }
+        continue;
+      }
+      draft = {};
+      const pair = rest.match(/^([A-Za-z0-9_-]+)\s*:\s*([\s\S]+)$/);
+      if (pair) applyNodeField(draft, pair[1], unquoteYaml(pair[2]));
+      continue;
+    }
+
+    if (!draft) continue;
+    const pair = trimmed.match(/^([A-Za-z0-9_-]+)\s*:\s*([\s\S]*)$/);
+    if (pair) applyNodeField(draft, pair[1], unquoteYaml(pair[2]));
+  }
+  finish();
+
+  const nodeTotal = Object.values(scan.nodes).reduce((sum, n) => sum + n, 0);
+  if (nodeTotal > 0) {
+    const kinds = Object.keys(scan.nodes).join("/");
+    const port = scan.localPorts[0];
+    scan.notes.push(
+      port
+        ? `${nodeTotal} 个 ${kinds} 节点 Electron 拨不了，已登记本机 ${port.key}=${port.port} 作为出口`
+        : `${nodeTotal} 个 ${kinds} 节点 Electron 拨不了，让本机 Clash/mihomo 跑起来后导入配置才能读到 mixed-port`,
+    );
+  }
+  if (scan.tokens.length) scan.notes.push(`${scan.tokens.length} 个 HTTP/SOCKS 代理可以直接拨`);
+  return scan;
+}
+
+export function emptyStats(kind = "unknown"): ProxyImportStats {
+  return { kind, usable: {}, nodes: {}, localPorts: [], notes: [] };
+}
+
+export function parseProxyText(
+  text: string,
+  defaultScheme: "http" | "socks5" = "http",
+): { tokens: ParsedToken[]; skipped: number; stats: ProxyImportStats } {
   return parseProxyTextDepth(text, defaultScheme, 0);
 }
 
@@ -236,14 +475,18 @@ function parseProxyTextDepth(
 ): {
   tokens: ParsedToken[];
   skipped: number;
+  stats: ProxyImportStats;
 } {
   const tokens: ParsedToken[] = [];
+  const stats = emptyStats();
   let skipped = 0;
   const seen = new Set<string>();
   const push = (url: string, label?: string) => {
     if (!url || seen.has(url)) return;
     seen.add(url);
     tokens.push({ url, label });
+    const scheme = url.slice(0, url.indexOf("://")).toLowerCase();
+    stats.usable[scheme] = (stats.usable[scheme] ?? 0) + 1;
   };
   const pushRaw = (raw: string, label?: string) => {
     const trimmed = raw.trim();
@@ -254,18 +497,39 @@ function parseProxyTextDepth(
   };
 
   const body = text.replace(/^\uFEFF/, "").trim();
-  if (!body) return { tokens, skipped };
+  if (!body) return { tokens, skipped, stats };
 
   if (depth < 2) {
     const inner = tryBase64Text(body);
-    if (inner) return parseProxyTextDepth(inner, defaultScheme, depth + 1);
+    if (inner) {
+      const nested = parseProxyTextDepth(inner, defaultScheme, depth + 1);
+      if (nested.tokens.length || nested.stats.nodes && Object.keys(nested.stats.nodes).length) {
+        return { ...nested, stats: { ...nested.stats, kind: "base64" } };
+      }
+    }
   }
 
-  // YAML 订阅里必然有 server:/port: 成对出现，命中就直接走 YAML 解析，避免把 key 当垃圾计入 skipped
-  if (/^\s*[-]?\s*server\s*:/im.test(body) && /^\s*[-]?\s*port\s*:/im.test(body)) {
-    const before = tokens.length;
-    parseYamlProxies(body, defaultScheme, push, () => (skipped += 1));
-    if (tokens.length > before) return { tokens, skipped };
+  // Clash/mihomo 配置：有 proxies 块，或者有成对的 server:/port:，或者读到了本机端口
+  const looksClash =
+    /^\s*(proxies|proxy-providers)\s*:/im.test(body) ||
+    /^\s*(mixed-port|socks-port)\s*:\s*\d/im.test(body) ||
+    (/^\s*-?\s*server\s*:/im.test(body) && /^\s*-?\s*port\s*:/im.test(body));
+  if (looksClash) {
+    const scan = scanClashConfig(body);
+    if (scan.structured) {
+      for (const token of scan.tokens) {
+        if (seen.has(token.url)) continue;
+        seen.add(token.url);
+        tokens.push(token);
+      }
+      // scan 已经按协议计过数，覆盖 push 里按 url 前缀记的那份
+      stats.kind = "clash";
+      stats.usable = { ...scan.usable };
+      stats.nodes = { ...scan.nodes };
+      stats.localPorts = [...scan.localPorts];
+      stats.notes = [...scan.notes];
+      return { tokens, skipped, stats };
+    }
   }
 
   const asJson = (() => {
@@ -279,6 +543,7 @@ function parseProxyTextDepth(
   })();
 
   if (asJson !== undefined) {
+    stats.kind = "json";
     const walk = (node: unknown, depth = 0): void => {
       if (depth > 8 || node == null) return;
       if (Array.isArray(node)) {
@@ -314,9 +579,10 @@ function parseProxyTextDepth(
       }
     };
     walk(asJson);
-    return { tokens, skipped };
+    return { tokens, skipped, stats };
   }
 
+  stats.kind = "list";
   for (const rawLine of body.split(/\r?\n/)) {
     const line = stripComment(rawLine).trim();
     if (!line) continue;
@@ -340,7 +606,7 @@ function parseProxyTextDepth(
     }
     for (const chunk of chunks) pushRaw(chunk);
   }
-  return { tokens, skipped };
+  return { tokens, skipped, stats };
 }
 
 function uniqueById(pool: ProxyPool): ProxyEntry[] {
@@ -383,21 +649,67 @@ function mergeEntries(pool: ProxyPool, tokens: ParsedToken[], source: ProxySourc
   };
 }
 
+/** 配置里声明的本机端口本身就是可拨的出口，Clash 的 ss/vmess 节点全靠它 */
+function localPortTokens(stats: ProxyImportStats): ParsedToken[] {
+  const out: ParsedToken[] = [];
+  for (const item of stats.localPorts) {
+    const url = normalizeProxyUrl(`${item.scheme}://127.0.0.1:${item.port}`);
+    if (url) out.push({ url, label: `本机 ${item.key} ${item.port}` });
+  }
+  return out;
+}
+
+function commitImport(
+  tokens: ParsedToken[],
+  source: ProxySource,
+  sourceLabel: string,
+  skipped: number,
+  stats: ProxyImportStats,
+): ProxyImportResult {
+  const all = [...tokens, ...localPortTokens(stats)];
+  const { pool, addedIds } = mergeEntries(readPool(), all, source);
+  return { pool, added: addedIds.length, addedIds, skipped, source: sourceLabel, stats };
+}
+
+function emptyParseMessage(stats: ProxyImportStats): string {
+  const nodeTotal = Object.values(stats.nodes).reduce((sum, n) => sum + n, 0);
+  if (nodeTotal > 0) {
+    return `这份配置里 ${nodeTotal} 个 ${Object.keys(stats.nodes).join("/")} 节点 Electron 不能直接拨；让本机 Clash/mihomo 跑起来，配置里带 mixed-port 时我会自动登记本机那个端口`;
+  }
+  return "没有认出代理地址：认 host:port、host:port:user:pass、scheme://user:pass@host:port、Clash YAML、JSON、CSV；别的格式交给「AI 解析」";
+}
+
 export function importProxyFile(file: string): ProxyImportResult {
   const stat = fs.statSync(file);
   if (stat.size > MAX_IMPORT_BYTES) throw new Error("配置文件超过 6 MB，先裁一下再导入");
   const text = fs.readFileSync(file, "utf8");
-  const { tokens, skipped } = parseProxyText(text);
-  if (!tokens.length) throw new Error("这份文件里没有认出代理地址，支持 host:port、host:port:user:pass、scheme://user:pass@host:port、JSON 和 CSV");
-  const { pool, addedIds } = mergeEntries(readPool(), tokens, "config");
-  return { pool, added: addedIds.length, addedIds, skipped, source: file };
+  const { tokens, skipped, stats } = parseProxyText(text);
+  if (!tokens.length && !stats.localPorts.length) throw new Error(emptyParseMessage(stats));
+  return commitImport(tokens, "config", file, skipped, stats);
 }
 
 export function importProxyText(text: string): ProxyImportResult {
-  const { tokens, skipped } = parseProxyText(text);
-  if (!tokens.length) throw new Error("没有认出代理地址，支持 host:port、host:port:user:pass、scheme://user:pass@host:port、JSON 和 CSV");
-  const { pool, addedIds } = mergeEntries(readPool(), tokens, "manual");
-  return { pool, added: addedIds.length, addedIds, skipped, source: "paste" };
+  const { tokens, skipped, stats } = parseProxyText(text);
+  if (!tokens.length && !stats.localPorts.length) throw new Error(emptyParseMessage(stats));
+  return commitImport(tokens, "manual", "paste", skipped, stats);
+}
+
+/** AI 从陌生格式里抽出来的地址，入库逻辑和本地解析共用一条路 */
+export function importProxyTokens(
+  tokens: ParsedToken[],
+  origin: string,
+  stats: ProxyImportStats = emptyStats("ai"),
+): ProxyImportResult {
+  const usable = emptyStats(stats.kind || "ai");
+  const merged: ProxyImportStats = {
+    ...usable,
+    ...stats,
+    notes: stats.notes ?? [],
+    localPorts: stats.localPorts ?? [],
+  };
+  const clean = tokens.filter((t) => normalizeProxyUrl(t.url));
+  if (!clean.length && !merged.localPorts.length) throw new Error("AI 没抽到可用的代理地址");
+  return commitImport(clean, "config", origin, 0, merged);
 }
 
 export function addProxy(raw: string, label?: string): ProxyPool {
@@ -454,46 +766,65 @@ export function advancePool(): ProxyPool {
 }
 
 /** 走指定代理的轻量探测；每个并发槽一个独立分区，避免互相改代理 */
-function probeViaSlot(slot: number, url: string, proxy: string): Promise<{ ok: boolean; ms: number; status?: number; error?: string }> {
+function probeOnce(
+  ses: Electron.Session,
+  url: string,
+  started: number,
+): Promise<{ ok: boolean; ms: number; status?: number; error?: string }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: { ok: boolean; ms: number; status?: number; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish({ ok: false, ms: Date.now() - started, error: "超时" }),
+      HEALTH_TIMEOUT_MS,
+    );
+    try {
+      const req = net.request({ url, method: "GET", session: ses, useSessionCookies: false });
+      req.on("response", (res) => {
+        clearTimeout(timer);
+        const status = res.statusCode;
+        finish({ ok: status > 0 && status < 400, ms: Date.now() - started, status });
+        res.on("data", () => undefined);
+        res.on("end", () => undefined);
+        res.on("error", () => undefined);
+      });
+      req.on("error", (err) => {
+        clearTimeout(timer);
+        finish({ ok: false, ms: Date.now() - started, error: err.message });
+      });
+      req.end();
+    } catch (err) {
+      clearTimeout(timer);
+      finish({ ok: false, ms: Date.now() - started, error: (err as Error).message });
+    }
+  });
+}
+
+function probeViaSlot(slot: number, proxy: string): Promise<{ ok: boolean; ms: number; status?: number; error?: string }> {
   const started = Date.now();
   const ses = session.fromPartition(`tanwei-pool-${slot}`);
   return ses
     .setProxy({ proxyRules: proxy, proxyBypassRules: "localhost,127.0.0.1,::1" })
     .catch(() => undefined)
-    .then(
-      () =>
-        new Promise((resolve) => {
-          let settled = false;
-          const finish = (value: { ok: boolean; ms: number; status?: number; error?: string }) => {
-            if (settled) return;
-            settled = true;
-            resolve(value);
-          };
-          const timer = setTimeout(
-            () => finish({ ok: false, ms: Date.now() - started, error: "超时" }),
-            HEALTH_TIMEOUT_MS,
-          );
-          try {
-            const req = net.request({ url: HEALTH_URL, method: "GET", session: ses, useSessionCookies: false });
-            req.on("response", (res) => {
-              clearTimeout(timer);
-              const status = res.statusCode;
-              finish({ ok: status > 0 && status < 400, ms: Date.now() - started, status });
-              res.on("data", () => undefined);
-              res.on("end", () => undefined);
-              res.on("error", () => undefined);
-            });
-            req.on("error", (err) => {
-              clearTimeout(timer);
-              finish({ ok: false, ms: Date.now() - started, error: err.message });
-            });
-            req.end();
-          } catch (err) {
-            clearTimeout(timer);
-            finish({ ok: false, ms: Date.now() - started, error: (err as Error).message });
-          }
-        }),
-    );
+    .then(async () => {
+      let last: { ok: boolean; ms: number; status?: number; error?: string } = {
+        ok: false,
+        ms: 0,
+        error: "无响应",
+      };
+      for (const url of HEALTH_URLS) {
+        last = await probeOnce(ses, url, started);
+        if (last.ok) return last;
+        // 代理自己通了、是上游那一段挂了才会换地址再判一次；超时不重试，免得一轮测活拖太久
+        const upstream = (last.status ?? 0) >= 400 || UPSTREAM_FAIL.test(last.error ?? "");
+        if (!upstream) return last;
+      }
+      return last;
+    });
 }
 
 export async function testProxies(ids?: string[], onTick?: (done: number, total: number) => void): Promise<ProxyPool> {
@@ -512,7 +843,10 @@ export async function testProxies(ids?: string[], onTick?: (done: number, total:
       cursor += 1;
       const entry = targets[idx];
       if (!entry) return;
-      const res = await probeViaSlot(slot, HEALTH_URL, entry.url);
+      // Chromium 吃不下带账号密码的代理，这类条目换 socket 探针，SOCKS 认证也一并支持
+      const res = WITH_CREDENTIALS.test(entry.url)
+        ? await probeCredentialedProxy(entry.url)
+        : await probeViaSlot(slot, entry.url);
       results.set(entry.id, {
         ...entry,
         health: res.ok ? "ok" : "bad",

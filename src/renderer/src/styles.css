@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --bg: #060b11;
   --bg-1: #08111a;
   --bg-2: #0b1621;
@@ -5488,6 +5488,164 @@ html[data-theme="light"] .pg-step:hover {
   opacity: 0.5;
   cursor: default;
 }
+
+/* ===== 代理 = 上传与解析 ===== */
+.proxy-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.proxy-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  margin: 10px 0;
+  padding: 18px 14px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.proxy-drop:hover,
+.proxy-drop.is-over {
+  border-color: var(--cyan);
+  background: rgba(33, 184, 165, 0.08);
+  color: var(--text-2);
+}
+
+.proxy-drop.is-busy {
+  cursor: progress;
+  opacity: 0.72;
+}
+
+.proxy-drop-title {
+  font-size: 12px;
+  color: var(--text-2);
+}
+
+.proxy-drop-sub {
+  font-size: 10.5px;
+  color: var(--muted-2);
+}
+
+.proxy-path {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.proxy-path .input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+}
+
+.proxy-path .btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.proxy-parsed {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.proxy-parsed-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.proxy-parsed-how {
+  min-width: 0;
+  color: var(--muted-2);
+  font-size: 10.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.proxy-parsed-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.proxy-parsed-row .kv-k {
+  flex: 0 0 96px;
+}
+
+.proxy-tags {
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.proxy-tag {
+  padding: 0 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.proxy-note-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-2);
+}
+
+.proxy-notes {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.pool-label {
+  flex: 0 1 auto;
+  max-width: 180px;
+  color: var(--muted);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+html[data-theme="light"] .proxy-drop,
+html[data-theme="light"] .proxy-parsed,
+html[data-theme="light"] .proxy-tag {
+  background: var(--panel-solid);
+}
+
+html[data-theme="light"] .proxy-drop:hover,
+html[data-theme="light"] .proxy-drop.is-over {
+  background: rgba(33, 184, 165, 0.08);
+}
+
 
 /* ===== 设置 · 浏览器窗口 ===== */
 .browser-modes {

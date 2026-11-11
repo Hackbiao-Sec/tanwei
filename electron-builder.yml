@@ -1,0 +1,43 @@
+appId: com.tanwei.grokconsole
+productName: Tanwei Console
+copyright: Tanwei Console
+directories:
+  output: release
+  buildResources: build
+files:
+  - out/**/*
+  - package.json
+  - "!**/*.map"
+extraResources:
+  - from: resources/grok
+    to: grok
+    filter:
+      - "**/*"
+  - from: tools/stream-fix-proxy.mjs
+    to: tools/stream-fix-proxy.mjs
+asar: true
+npmRebuild: false
+win:
+  icon: build/icon.ico
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  requestedExecutionLevel: asInvoker
+nsis:
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: 天鉴·探微
+  artifactName: TanweiConsole-${version}-setup.${ext}
+portable:
+  unicode: true
+  artifactName: TanweiConsole-${version}-portable.${ext}

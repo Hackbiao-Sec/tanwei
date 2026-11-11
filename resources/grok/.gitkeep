@@ -1,0 +1,7 @@
+这个目录用来放内置的 grok.exe（打包时通过 extraResources 复制到安装目录）。
+
+二进制不进 git：克隆仓库后先在本机装好 grok CLI，再跑
+
+    npm run embed:grok
+
+就会把本机的 grok.exe 复制进来，然后 npm run dist 才能打出带引擎的包。

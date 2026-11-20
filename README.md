@@ -53,26 +53,7 @@ npm run dist         # 打 portable exe（自动先 build）
 
 即：本机已装 grok 时可直接开发调试；要「把 grok.exe 镶进 exe」就跑 `embed:grok` 再打包，换机器也能带着走。
 
-## 能力映射（原生功能都在）
-
-| grok 原生 | 本控制台 |
-|-----------|----------|
-| 流式回答 / 推理 | 时间线实时追加，推理折叠可展开 |
-| 工具调用（shell / 读写 / 搜索 / MCP 工具…） | 工具卡：状态、耗时、输入、输出、涉及文件可点开 |
-| 权限审批 | 权限卡直接回 `session/request_permission`，支持逐项/自动/规划/全部放行（本机 1.0.70 默认自动放行，不发请求时无卡） |
-| 计划（plan） | 时间线计划卡 + 右栏行动方案 |
-| 斜杠命令 | 输入 `/` 唤起命令面板（`/plan` `/model` `/status` `/always-approve` `/auto` …） |
-| 模型切换 | 输入区模型下拉，走 `session/set_config_option` |
-| 自定义模型 / API 端点 | 「模型」模块页：增删改任意 `[model.*]`（model、base_url、api_key / env_key、协议、上下文、温度…），保存后自动重启引擎生效 |
-| 会话历史 | 左侧历史列表，`session/load` 回放，缺回放时读 `chat_history.jsonl` 兜底 |
-| 取消回合 | 停止按钮 / `Esc`，发 `session/cancel` |
-| 用量 | 右栏 token、缓存、推理、上下文占用 |
-| MCP | 状态点实时来自 `x.ai/mcp/server_status`，也可读 `grok mcp list` |
-| Skill / 规则 | 模块页扫描 `~/.grok/skills`、`~/.claude/skills`、`~/.grok/rules`；技能页每行有启用开关，直接写 `[skills] disabled`，不用改文件 |
-| 任务资产 / 报告 | 模块页扫描桌面 `*_SRC挖洞/资产`、`/报告` |
-| 原生 TUI | 右上「原生 TUI」，用 Windows Terminal / cmd 拉起 `grok` |
-
-## 作战模块（参考 ARTEX 补齐）
+## 作战模块
 
 左侧导航分「作战 / 配置」两组，页面直接读任务夹与引擎状态，不改动任何 grok 配置：
 
@@ -149,11 +130,11 @@ npm run dist         # 打 portable exe（自动先 build）
 
 ### 工具名被冲成空串（上游流式分片的问题）
 
-有些中转（如 autorouter 上的 DeepSeek 系列）在流式 tool_call 的后续分片里把 `id` / `type` / `function.name` 重新发成空串。grok 合并 delta 是「后到覆盖」，工具名被冲成 `""`，于是报 `Failed to parse arguments for tool ``: Tool not found:`，整个会话的工具都用不了。
+有些中转在流式 tool_call 的后续分片里把 `id` / `type` / `function.name` 重新发成空串。grok 合并 delta 是「后到覆盖」，工具名被冲成 `""`，于是报 `Failed to parse arguments for tool ``: Tool not found:`，整个会话的工具都用不了。
 
 两条处理路线，优先第一条：
 
-1. **换一个流式分片干净的端点**。DeepSeek 官方 `https://api.deepseek.com/v1`（`deepseek-chat` / `deepseek-reasoner`）实测不重发空字段，配 `env_key = "DEEPSEEK_API_KEY"` 就能直接用工具；同一个 autorouter 上 `kimi-k3`、`glm-5.3` 也干净。**autorouter 上的四款 DeepSeek 全都不干净**，想用 DeepSeek 就走官方端点。
+1. **换一个流式分片干净的端点**。DeepSeek 官方 `https://api.deepseek.com/v1`（`deepseek-chat` / `deepseek-reasoner`）实测不重发空字段，配 `env_key = "DEEPSEEK_API_KEY"` 就能直接用工具。
 2. **非要那个模型时**，用 `tools/stream-fix-proxy.mjs` 在本地把值为空串的这几个字段删掉再转发。探微只在 `config.toml` 里出现 `127.0.0.1:8787` / `127.0.0.1:8788` 时才拉起它，默认配置直连上游、什么都不起。
 
 自测某个模型是否干净：`grok -p "用 run_terminal_command 执行 echo ok" --model <名> --always-approve`，报 `Tool not found:` 就是它流式分片不干净。
@@ -184,11 +165,3 @@ scripts/icon/TanweiIcon.cs + scripts/make-icon.ps1  生成 build/icon.ico / icon
 electron-builder.yml   打包配置（nsis 安装版 + portable 免安装，extraResources 带 grok）
 ```
 
-## 说明与限制
-
-- UI 参考的是「情报作战台」这类深色指挥台语言；天鉴探微没有公开资料，拿到截图后可按同一套 token（`src/renderer/src/styles.css` 顶部变量）精调配色/布局。
-- 一个引擎进程承载多个会话；同一会话同时只跑一个回合。
-- 切换模式是通过对应斜杠命令完成的，因此时间线里会看到一条 `/plan`、`/auto` 之类的命令记录。
-- 打包体积包含 grok.exe 本身（约 168 MB），portable 包会更大。
-- 权限卡：本机 grok 1.0.70 在 ACP 通道下对工具调用是自动放行的（即使 `config.toml` 里把 `permission_mode` 改成 `ask` 也不发 `session/request_permission`）。界面已完整实现权限卡的渲染与 `session/request_permission` 回传；引擎一旦发请求就会弹出。自检可用 `TANWEI_DEBUG_PERM=1` 启动后调用 `window.tanwei.debugPermission()` 伪造一张卡，验证批准/拒绝链路。
-- 用量数字取自 `session/prompt` 回包的 `_meta.usage`（camelCase 字段），右栏随后刷新已用/上下文。

@@ -3,36 +3,50 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { TimelineItem, ToolCallView } from "../shared/types";
+import { tasksFromToolCall } from "./sessionScope";
 
 function sessionStoreRoot(): string {
   return path.join(process.env.GROK_HOME || path.join(os.homedir(), ".grok"), "sessions");
 }
 
-/** 会话里出现过哪些任务夹：扫会话落盘记录，比内存里的事件更全 */
+/** 会话里动过哪些任务夹：只看工具调用真实写/执行过的路径，读到或总结里提到的不算 */
 export async function sessionTaskNames(sessionId: string, known: string[]): Promise<string[]> {
   const dir = await findSessionDir(sessionId);
   if (!dir) return [];
-  const files = ["chat_history.jsonl", "updates.jsonl", "prompt_context.json"];
   const found = new Set<string>();
   const HEAD = 8_000_000;
   const TAIL = 2_000_000;
-  for (const name of files) {
-    let text = "";
+  let text = "";
+  try {
+    const buf = await fsp.readFile(path.join(dir, "chat_history.jsonl"));
+    // 任务夹常在会话开头那段上下文里出现，尾部也可能有；两头都要看
+    const head = buf.subarray(0, Math.min(buf.length, HEAD)).toString("utf8");
+    const tail = buf.length > HEAD ? buf.subarray(Math.max(0, buf.length - TAIL)).toString("utf8") : "";
+    text = head + "\n" + tail;
+  } catch {
+    return [];
+  }
+  for (const line of text.split("\n")) {
+    if (!line.includes("_SRC挖洞")) continue;
+    let row: any;
     try {
-      const buf = await fsp.readFile(path.join(dir, name));
-      // 任务路径常常在会话开头那段上下文里，尾部也可能有；两头都要看
-      const head = buf.subarray(0, Math.min(buf.length, HEAD)).toString("utf8");
-      const tail = buf.length > HEAD ? buf.subarray(Math.max(0, buf.length - TAIL)).toString("utf8") : "";
-      text = head + tail;
+      row = JSON.parse(line);
     } catch {
       continue;
     }
-    // 任务夹在磁盘上叫 `<任务名>_SRC挖洞`，任务名本身不带后缀
-    for (const task of known) {
-      if (text.includes(`${task}_SRC挖洞`)) found.add(task);
+    // 新格式把工具调用放 tool_calls，旧格式是 content 里的 tool_use 块
+    const calls: any[] = Array.isArray(row?.tool_calls)
+      ? row.tool_calls
+      : Array.isArray(row?.content)
+        ? row.content.filter((c: any) => c && (c.type === "tool_use" || c.type === "tool_call"))
+        : [];
+    for (const call of calls) {
+      const name = String(call?.name ?? call?.tool ?? "");
+      const args = call?.arguments ?? call?.input ?? {};
+      for (const task of tasksFromToolCall(name, args)) found.add(task);
     }
   }
-  return [...found];
+  return [...found].filter((t) => known.includes(t));
 }
 
 export async function findSessionDir(sessionId: string): Promise<string | undefined> {
@@ -54,6 +68,35 @@ export async function findSessionDir(sessionId: string): Promise<string | undefi
     }
   }
   return undefined;
+}
+
+/** 删掉磁盘上的会话目录；只允许删 sessions 根下面的那一层，找不到就当已删 */
+export async function deleteSessionDir(sessionId: string): Promise<boolean> {
+  const id = sessionId.trim();
+  if (!id || /[\\/]/.test(id) || id === "." || id === "..") throw new Error("会话 id 不合法");
+  const dir = await findSessionDir(id);
+  if (!dir) return false;
+  const root = sessionStoreRoot();
+  const resolved = path.resolve(dir);
+  if (!resolved.startsWith(path.resolve(root) + path.sep)) throw new Error("会话目录不在 sessions 根下，拒绝删除");
+  // 引擎刚关闭会话时句柄可能还没完全释放，退避重试几次
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      await fsp.rm(resolved, { recursive: true, force: true });
+      return true;
+    } catch (err) {
+      lastErr = err;
+      if ((err as NodeJS.ErrnoException)?.code !== "EPERM" && (err as NodeJS.ErrnoException)?.code !== "EBUSY") throw err;
+      await new Promise((r) => setTimeout(r, 120 * (attempt + 1)));
+    }
+  }
+  const code = (lastErr as NodeJS.ErrnoException)?.code;
+  throw new Error(
+    code === "EPERM" || code === "EBUSY"
+      ? "会话文件正被其他进程占用（可能正在别处使用这个会话），请关闭后重试"
+      : `删除会话目录失败：${(lastErr as Error)?.message ?? String(lastErr)}`,
+  );
 }
 
 function userText(content: any): string {

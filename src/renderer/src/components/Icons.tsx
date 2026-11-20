@@ -27,6 +27,12 @@ type IconName =
   | "moon"
   | "globe"
   | "upload"
+  | "bell"
+  | "gauge"
+  | "node"
+  | "phone"
+  | "mini"
+  | "android"
   | "win-min"
   | "win-max"
   | "win-restore"
@@ -142,9 +148,51 @@ const paths: Record<IconName, React.ReactNode> = {
       <path d="M4 15v3a2 2 0 002 2h12a2 2 0 002-2v-3" />
     </>
   ),
+  bell: (
+    <>
+      <path d="M6 10a6 6 0 1112 0c0 4 1.5 5.5 1.5 5.5H4.5S6 14 6 10z" />
+      <path d="M10 19a2 2 0 004 0" />
+    </>
+  ),
+  gauge: (
+    <>
+      <path d="M4 18a8 8 0 1116 0" />
+      <path d="M12 18l4.5-5" />
+      <circle cx="12" cy="18" r="1.4" />
+    </>
+  ),
+  node: (
+    <>
+      <circle cx="6" cy="6" r="2.5" />
+      <circle cx="18" cy="7" r="2.5" />
+      <circle cx="9" cy="18" r="2.5" />
+      <path d="M8.3 7.2l7.4-.4M7.4 8.3l1.2 7.3M16 9.2l-5.4 7" />
+    </>
+  ),
   "win-min": <path d="M5 12h14" />,
-  "win-max": <rect x="6" y="6" width="12" height="12" rx="1.5" />,
-  "win-restore": (
+  phone: (
+    <>
+      <rect x="7" y="3" width="10" height="18" rx="2" />
+      <path d="M10.5 18.2h3" />
+    </>
+  ),  "win-max": <rect x="6" y="6" width="12" height="12" rx="1.5" />,
+  mini: (
+    <>
+      <rect x="3" y="3.5" width="18" height="17" rx="2.5" />
+      <path d="M3 8.5h18" />
+      <circle cx="8" cy="14" r="1.2" />
+      <circle cx="12" cy="14" r="1.2" />
+      <circle cx="16" cy="14" r="1.2" />
+    </>
+  ),
+  android: (
+    <>
+      <path d="M6 10.5a6 6 0 0112 0V15a2.5 2.5 0 01-2.5 2.5h-7A2.5 2.5 0 016 15z" />
+      <path d="M8.6 5.8L7.2 3.4M15.4 5.8l1.4-2.4" />
+      <circle cx="9.6" cy="9.8" r=".7" />
+      <circle cx="14.4" cy="9.8" r=".7" />
+    </>
+  ),  "win-restore": (
     <>
       <rect x="5" y="8.5" width="10" height="10" rx="1.5" />
       <path d="M8.5 5.5h8a2 2 0 012 2v8" />

@@ -1,5 +1,7 @@
-import { contextBridge, ipcRenderer } from "electron";
+import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type {
+  AdbActionInput,
+  AdbActionResult,
   AssetItem,
   TaskFile,
   AssetTask,
@@ -8,11 +10,15 @@ import type {
   Finding,
   HttpRequestInput,
   HttpResponseView,
+  RawHttpInput,
+  RawHttpResult,
   LogFile,
   LogTail,
   McpServerConfigInput,
   McpServersConfig,
   McpServerInfo,
+  McpProbeInput,
+  McpProbeResult,
   ModelConfigInput,
   ModelProbeInput,
   ModelProbeResult,
@@ -25,6 +31,31 @@ import type {
   ProxyAiResult,
   ProxyImportResult,
   ProxyPool,
+  ProxyRotation,
+  ProxySpeedResult,
+  ClashStatus,
+  ClashSwitchResult,
+  PoolEvent,
+  MobileActionResult,
+  MobileAnalysis,
+  MobileAppList,
+  MobileDynamicInput,
+  MobileEnvInfo,
+  MobileHistoryRecord,
+  MobileKind,
+  MobilePentestMode,
+  MobileScanResult,
+  MobileToolInstallResult,
+  MobileToolProgress,
+  MobileToolReport,
+  MobileUpload,
+  MiniDirHint,
+  NotifyChannel,
+  NotifyConfig,
+  NotifyDrillResult,
+  NotifyTestResult,
+  RiskSignal,
+  AssetCatalog,
   RendererEvent,
   ReportEntry,  RuleEntry,
   SessionState,
@@ -32,6 +63,7 @@ import type {
   SkillEntry,
   SkillInstallResult,
   NewSkillInput,
+  SessionScopeSnapshot,
   WorkspaceStats,
 } from "../shared/types";
 
@@ -53,6 +85,8 @@ const api = {
     ipcRenderer.invoke("config:save-mcp", input),
   deleteMcpServer: (name: string): Promise<McpServersConfig> =>
     ipcRenderer.invoke("config:delete-mcp", name),
+  probeMcpServer: (input: McpProbeInput): Promise<McpProbeResult> =>
+    ipcRenderer.invoke("mcp:probe", input),
   setWindowTheme: (theme: "dark" | "light"): Promise<"dark" | "light"> =>
     ipcRenderer.invoke("window:theme", theme),
   minimizeWindow: (): Promise<boolean> => ipcRenderer.invoke("window:minimize"),
@@ -73,6 +107,8 @@ const api = {
   prompt: (sessionId: string, text: string): Promise<boolean> =>
     ipcRenderer.invoke("session:prompt", { sessionId, text }),
   cancel: (sessionId: string): Promise<boolean> => ipcRenderer.invoke("session:cancel", sessionId),
+  deleteSession: (sessionId: string): Promise<{ ok: boolean; id: string; removed: boolean }> =>
+    ipcRenderer.invoke("session:delete", sessionId),
   setModel: (sessionId: string, modelId: string): Promise<boolean> =>
     ipcRenderer.invoke("session:set-model", { sessionId, modelId }),
   setMode: (sessionId: string, mode: PermissionMode): Promise<boolean> =>
@@ -99,6 +135,18 @@ const api = {
   sessionTasks: (sessionId: string): Promise<string[]> => ipcRenderer.invoke("session:tasks", sessionId),
   sessionArtifacts: (sessionId: string | undefined, known: string[]): Promise<SessionArtifacts> =>
     ipcRenderer.invoke("session:artifacts", { sessionId, known }),
+  /** 会话级产物快照：任务夹 / 报告 / 资产 / 文件 / 绑定情况，界面「本会话」档位只吃这一份 */
+  sessionScope: (sessionId?: string): Promise<SessionScopeSnapshot> =>
+    ipcRenderer.invoke("session:scope", sessionId),
+  sessionBind: (sessionId: string, task: string): Promise<boolean> =>
+    ipcRenderer.invoke("session:bind", { sessionId, task }),
+  sessionUnbind: (sessionId: string, task: string): Promise<boolean> =>
+    ipcRenderer.invoke("session:unbind", { sessionId, task }),
+  onScopeChanged: (cb: () => void): (() => void) => {
+    const listener = () => cb();
+    ipcRenderer.on("scope:changed", listener);
+    return () => ipcRenderer.removeListener("scope:changed", listener);
+  },
   logs: (): Promise<LogFile[]> => ipcRenderer.invoke("system:logs"),
   logTail: (target: string, lines?: number): Promise<LogTail> =>
     ipcRenderer.invoke("system:log-tail", target, lines),
@@ -107,6 +155,8 @@ const api = {
   relaunchSafe: (): Promise<boolean> => ipcRenderer.invoke("app:relaunch-safe"),
   sendRequest: (input: HttpRequestInput): Promise<HttpResponseView> =>
     ipcRenderer.invoke("http:send", input),
+  sendRawRequest: (input: RawHttpInput): Promise<RawHttpResult> =>
+    ipcRenderer.invoke("http:send-raw", input),
   skills: (): Promise<SkillEntry[]> => ipcRenderer.invoke("system:skills"),
   installSkillFolder: (): Promise<SkillInstallResult> => ipcRenderer.invoke("skills:install-folder"),
   installSkillZip: (): Promise<SkillInstallResult> => ipcRenderer.invoke("skills:install-zip"),
@@ -138,10 +188,130 @@ const api = {
     ipcRenderer.invoke("pool:enable", { id, enabled }),
   setPoolActive: (id?: string): Promise<ProxyPool> => ipcRenderer.invoke("pool:active", id),
   setPoolRotate: (rotate: boolean): Promise<ProxyPool> => ipcRenderer.invoke("pool:rotate", rotate),
-  testProxies: (ids?: string[]): Promise<ProxyPool> => ipcRenderer.invoke("pool:test", ids),
+  setPoolRotation: (patch: Partial<ProxyRotation>): Promise<ProxyPool> =>
+    ipcRenderer.invoke("pool:rotation", patch),
+  rotateNow: (
+    input?: { reason?: "manual" | "ban" | "fastest" | "interval"; restart?: boolean },
+  ): Promise<{ pool: ProxyPool; via: "clash" | "pool" | "none"; selected?: string; label?: string; error?: string }> =>
+    ipcRenderer.invoke("pool:rotate-now", input),
+  clashStatus: (): Promise<ClashStatus> => ipcRenderer.invoke("pool:clash"),
+  setClashController: (input: {
+    controller?: string;
+    secret?: string;
+    group?: string;
+  }): Promise<{ pool: ProxyPool; status: ClashStatus }> => ipcRenderer.invoke("pool:clash-controller", input),
+  clashSelect: (input: { name: string; group?: string }): Promise<ClashSwitchResult> =>
+    ipcRenderer.invoke("pool:clash-select", input),
+  clashRotate: (reason?: string): Promise<{ pool: ProxyPool; status: ClashStatus; to?: string; error?: string }> =>
+    ipcRenderer.invoke("pool:clash-rotate", reason),
+  clashFastest: (): Promise<{
+    pool: ProxyPool;
+    status: ClashStatus;
+    to?: string;
+    delays: Record<string, number>;
+    error?: string;
+  }> => ipcRenderer.invoke("pool:clash-fastest"),
+  // 小程序 / APP 渗透
+  mobileOutRoot: (): Promise<string> => ipcRenderer.invoke("mobile:out-root"),
+  mobilePickDir: (): Promise<string | undefined> => ipcRenderer.invoke("mobile:pick-dir"),
+  mobilePickApp: (): Promise<string[]> => ipcRenderer.invoke("mobile:pick-app"),
+  mobileScan: (dir: string): Promise<MobileScanResult> => ipcRenderer.invoke("mobile:scan", dir),
+  mobileAnalyze: (input: {
+    path: string;
+    kind?: MobileKind;
+    name?: string;
+    sessionId?: string;
+  }): Promise<MobileAnalysis> => ipcRenderer.invoke("mobile:analyze", input),
+  mobileHistory: (sessionId?: string): Promise<MobileHistoryRecord[]> =>
+    ipcRenderer.invoke("mobile:history", sessionId),
+  mobileHistoryForget: (id: string): Promise<boolean> => ipcRenderer.invoke("mobile:history-forget", id),
+  mobileHistoryClaim: (id: string, sessionId?: string): Promise<boolean> =>
+    ipcRenderer.invoke("mobile:history-claim", id, sessionId),
+  mobileHistoryClear: (sessionId?: string): Promise<number> =>
+    ipcRenderer.invoke("mobile:history-clear", sessionId),
+  mobileEnv: (): Promise<MobileEnvInfo> => ipcRenderer.invoke("mobile:env"),
+  mobileApps: (serial?: string): Promise<MobileAppList> => ipcRenderer.invoke("mobile:apps", serial),
+  mobileAppLabel: (input: {
+    serial?: string;
+    packageName: string;
+    apkPath?: string;
+    versionCode?: string;
+  }): Promise<{ ok: boolean; label?: string; apkPath?: string; hint?: string }> =>
+    ipcRenderer.invoke("mobile:app-label", input),
+  mobilePullApk: (input: {
+    serial?: string;
+    packageName: string;
+    apkPath?: string;
+  }): Promise<{ ok: boolean; path?: string; hint?: string }> =>
+    ipcRenderer.invoke("mobile:pull-apk", input),
+  mobileDynamic: (input: MobileDynamicInput): Promise<MobileActionResult> =>
+    ipcRenderer.invoke("mobile:dynamic", input),
+  mobilePrompt: (input: {
+    analysis: MobileAnalysis;
+    mode: MobilePentestMode;
+    env?: MobileEnvInfo;
+  }): Promise<string> => ipcRenderer.invoke("mobile:prompt", input),
+  // 移动端工具链：整体检测 / 一键下载 / 单个下载
+  toolkitReport: (): Promise<MobileToolReport> => ipcRenderer.invoke("toolkit:report"),
+  toolkitInstall: (name: string): Promise<MobileToolInstallResult> =>
+    ipcRenderer.invoke("toolkit:install", name),
+  toolkitInstallAll: (names?: string[]): Promise<MobileToolInstallResult[]> =>
+    ipcRenderer.invoke("toolkit:install-all", names),
+  toolkitOpenRoot: (): Promise<boolean> => ipcRenderer.invoke("toolkit:open-root"),
+  toolkitProbe: (): Promise<{ ok: boolean; path?: string; version?: string; hint?: string }> =>
+    ipcRenderer.invoke("toolkit:probe"),
+  toolkitOpenDir: (name?: string): Promise<boolean> => ipcRenderer.invoke("toolkit:open-dir", name),
+  onToolkitProgress: (cb: (p: MobileToolProgress) => void): (() => void) => {
+    const handler = (_e: unknown, p: MobileToolProgress) => cb(p);
+    ipcRenderer.on("toolkit:progress", handler);
+    return () => ipcRenderer.off("toolkit:progress", handler);
+  },
+  wechatDirs: (): Promise<MiniDirHint[]> => ipcRenderer.invoke("mobile:wechat-dirs"),
+  // ADB 连接中心
+  adbAction: (input: import("../shared/types").AdbActionInput): Promise<AdbActionResult> =>
+    ipcRenderer.invoke("adb:action", input),
+  // 对话上传
+  uploadAdd: (files: string[], sessionId?: string): Promise<MobileUpload[]> =>
+    ipcRenderer.invoke("upload:add", files, sessionId),
+  uploadList: (sessionId?: string): Promise<MobileUpload[]> =>
+    ipcRenderer.invoke("upload:list", sessionId),
+  uploadClaim: (id: string, sessionId?: string): Promise<MobileUpload[]> =>
+    ipcRenderer.invoke("upload:claim", id, sessionId),
+  uploadForget: (id: string): Promise<MobileUpload[]> => ipcRenderer.invoke("upload:forget", id),
+  uploadClear: (sessionId?: string): Promise<MobileUpload[]> => ipcRenderer.invoke("upload:clear", sessionId),
+  uploadRoot: (): Promise<string> => ipcRenderer.invoke("upload:root"),
+  pickFiles: (): Promise<string[]> => ipcRenderer.invoke("upload:pick"),
+  pathOfFile: (file: File): string => webUtils.getPathForFile(file),
+  markProxyFail: (id: string, error?: string): Promise<ProxyPool> =>
+    ipcRenderer.invoke("pool:fail", { id, error }),  testProxies: (ids?: string[]): Promise<ProxyPool> => ipcRenderer.invoke("pool:test", ids),
+  testSpeeds: (ids?: string[]): Promise<ProxySpeedResult> => ipcRenderer.invoke("pool:speed", ids),
+  onPoolEvent: (cb: (ev: PoolEvent) => void): (() => void) => {
+    const handler = (_e: unknown, ev: PoolEvent) => cb(ev);
+    ipcRenderer.on("pool:event", handler);
+    return () => ipcRenderer.off("pool:event", handler);
+  },
+  notifyConfig: (): Promise<NotifyConfig> => ipcRenderer.invoke("notify:get"),
+  notifyPath: (): Promise<string> => ipcRenderer.invoke("notify:path"),
+  saveNotifyChannel: (input: Partial<NotifyChannel> & { url: string }): Promise<NotifyConfig> =>
+    ipcRenderer.invoke("notify:save-channel", input),
+  removeNotifyChannel: (id: string): Promise<NotifyConfig> =>
+    ipcRenderer.invoke("notify:remove-channel", id),
+  setNotifyOptions: (patch: Partial<NotifyConfig>): Promise<NotifyConfig> =>
+    ipcRenderer.invoke("notify:options", patch),
+  testNotify: (input: { id?: string; kind?: string; url?: string; secret?: string; text?: string }): Promise<NotifyTestResult> =>
+    ipcRenderer.invoke("notify:test", input),
+  drillNotify: (event?: string): Promise<NotifyDrillResult> => ipcRenderer.invoke("notify:drill", event),
+  onRiskEvent: (cb: (sig: RiskSignal) => void): (() => void) => {
+    const handler = (_e: unknown, sig: RiskSignal) => cb(sig);
+    ipcRenderer.on("risk:event", handler);
+    return () => ipcRenderer.off("risk:event", handler);
+  },
+  assetCatalog: (scope?: string[]): Promise<AssetCatalog> => ipcRenderer.invoke("assets:catalog", scope),
   fetchFreeProxies: (limit?: number): Promise<ProxyFreeResult> => ipcRenderer.invoke("pool:fetch-free", limit),
   clearPool: (): Promise<ProxyPool> => ipcRenderer.invoke("pool:clear"),
   rules: (): Promise<RuleEntry[]> => ipcRenderer.invoke("system:rules"),
+  setRuleDisabled: (rulePath: string, disabled: boolean): Promise<RuleEntry[]> =>
+    ipcRenderer.invoke("rules:set-disabled", { path: rulePath, disabled }),
   mcp: (): Promise<McpServerInfo[]> => ipcRenderer.invoke("system:mcp"),
 };
 

@@ -1,6 +1,12 @@
-# 天鉴·探微 | 安全测试平台
+# 天鉴 | 安全测试平台
 
-以本机 `grok.exe` 为内核、参考「天鉴探微」情报作战台风格的桌面控制台。不是把 TUI 塞进 iframe，也不是重写一个只会聊天的壳：界面通过 **ACP（Agent Client Protocol，JSON-RPC over stdio）** 驱动 `grok agent --no-leader stdio`，grok 的工具、命令、MCP、Skill、Workflow、权限审批、计划、用量全部照原样可用；需要纯终端时一键拉原生 TUI。
+**天鉴**是一个安全测试平台项目；**探微（Tanwei Console）** 是其中第一个工具——以本机 `grok.exe` 为内核、参考「天鉴探微」情报作战台风格的桌面控制台。后续工具会按同一套资产、图谱、报告模型继续扩展。
+
+> **仅限授权使用。** 本项目只用于获得明确授权的安全测试、自有系统测试与教学研究。禁止用于任何未授权访问、攻击或数据获取。完整条款见 [DISCLAIMER.md](DISCLAIMER.md)。
+>
+> 本项目是独立第三方工具，与 xAI 无隶属、合作或背书关系。Grok 名称、商标与二进制归 xAI 所有；本仓库和发行包都不包含 grok 二进制，需自行通过官方渠道获取并遵守其许可。
+
+探微的界面通过 **ACP（Agent Client Protocol，JSON-RPC over stdio）** 驱动 `grok agent --no-leader stdio`，grok 的工具、命令、MCP、Skill、Workflow、权限审批、计划、用量全部照原样可用；需要纯终端时一键拉原生 TUI。
 
 ```
 ┌ 标题栏：引擎状态 · 当前会话 · MCP 就绪数 · 待授权 · 原生 TUI
@@ -12,7 +18,7 @@
 ## 快速开始
 
 ```powershell
-cd C:\Users\Hackbiao\Projects\tanwei
+cd tanwei
 npm install
 npm run dev          # 开发模式，热更新
 npm run typecheck    # 主进程 + 渲染层类型检查

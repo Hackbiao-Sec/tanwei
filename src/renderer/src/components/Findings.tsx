@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { Finding, FindingSeverity } from "@shared/types";
 import { Icon } from "./Icons";
 import { Markdown } from "./Markdown";
 import { ScopeSwitch } from "./ScopeSwitch";
 import { copyText } from "../lib/clipboard";
+import { useSessionScope } from "../lib/sessionScope";
 
 const SEVERITIES: FindingSeverity[] = ["严重", "高危", "中危", "低危", "未知"];
 
@@ -22,53 +23,41 @@ function fmtTime(t: number): string {
   return `${d.getMonth() + 1}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-export function Findings({
-  onAsk,
-  sessionTasks = [],
-  activeId,
-}: {
-  onAsk: (prompt: string) => void;
-  sessionTasks?: string[];
-  activeId?: string;
-}) {
-  // 本会话 = 只读这个会话碰过的任务夹；总览 = 全桌面。两份数据分开放，不互相顶替
-  const [sessionList, setSessionList] = useState<Finding[]>([]);
+export function Findings({ onAsk }: { onAsk: (prompt: string) => void }) {
+  // 本会话 = 只读这个会话认领的任务夹；总览 = 全桌面。两份数据分开放，不互相顶替
+  const ctx = useSessionScope();
   const [globalList, setGlobalList] = useState<Finding[]>([]);
-  const [resolvedTasks, setResolvedTasks] = useState<string[]>([]);
+  const [globalLoaded, setGlobalLoaded] = useState(false);
+  const globalSeq = useRef(0);
+  const globalAt = useRef(0);
   const [scope, setScope] = useState<"session" | "all">("session");
   const [query, setQuery] = useState("");
   const [severity, setSeverity] = useState<"全部" | FindingSeverity>("全部");
   const [selected, setSelected] = useState<Finding>();
   const [content, setContent] = useState("");
-  const [loading, setLoading] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [error, setError] = useState<string>();
   const [copied, setCopied] = useState(false);
 
-  const knownKey = sessionTasks.join("|");
+  const sessionList = ctx.findings;
+  const resolvedTasks = ctx.tasks;
+  const loading = ctx.loading;
+  const error = ctx.error;
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setError(undefined);
-    try {
-      const known = knownKey ? knownKey.split("|") : [];
-      const [own, all] = await Promise.all([
-        window.tanwei.sessionArtifacts(activeId, known),
-        window.tanwei.findings(),
-      ]);
-      setSessionList(own.findings);
-      setResolvedTasks(own.tasks);
-      setGlobalList(all);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, [activeId, knownKey]);
-
+  // 总览要把桌面所有报告正文读一遍，只在切到总览时才拉，15 秒内复用
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (scope !== "all") return;
+    if (globalLoaded && Date.now() - globalAt.current < 15_000) return;
+    const mine = ++globalSeq.current;
+    void window.tanwei
+      .findings()
+      .then((all) => {
+        if (mine !== globalSeq.current) return;
+        setGlobalList(all);
+        setGlobalLoaded(true);
+        globalAt.current = Date.now();
+      })
+      .catch(() => undefined);
+  }, [scope, globalLoaded, ctx.version]);
 
   const scoped = scope === "session" ? sessionList : globalList;
 
@@ -161,7 +150,7 @@ export function Findings({
   const emptyHint =
     scope === "session"
       ? resolvedTasks.length === 0
-        ? "这个会话还没碰过任务夹。这里的报告只认本会话任务；看别的会话点上面「总览」。"
+        ? "这个会话还没认领任务夹。点上面「归属」把桌面上的任务夹勾给它；看全桌面点「总览」。"
         : "本会话任务还没有落盘报告。看别的会话点上面「总览」。"
       : "还没有正式报告。挖到洞后按报告格式落盘即可汇总。";
 
@@ -208,10 +197,10 @@ export function Findings({
           tasks={resolvedTasks}
           scope={scope}
           onScope={setScope}
-          total={globalList.length}
+          total={globalLoaded ? globalList.length : undefined}
           scoped={sessionList.length}
         />
-        <button className="btn ghost" onClick={() => void load()}>
+        <button className="btn ghost" onClick={() => ctx.refresh()}>
           <Icon name="refresh" size={13} />
           <span>{loading ? "读取中…" : "刷新"}</span>
         </button>

@@ -1,7 +1,9 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { SessionState, SessionSummary, TaskFile } from "@shared/types";
 import { Icon } from "./Icons";
 import { FileViewer, type PreviewTarget } from "./FileViewer";
+import { ScopeSwitch } from "./ScopeSwitch";
+import { useSessionScope } from "../lib/sessionScope";
 
 function relTime(input?: number | string): string {
   if (!input) return "—";
@@ -46,33 +48,56 @@ export function Tasks({
   const [fileQuery, setFileQuery] = useState("");
   const [fileBusy, setFileBusy] = useState(false);
   const [preview, setPreview] = useState<PreviewTarget | null>(null);
+  // 任务文件默认只看本会话认领的任务夹，总览才扫全桌面
+  const ctx = useSessionScope();
+  const [fileScope, setFileScope] = useState<"session" | "all">("session");
+  const fileSeq = useRef(0);
+  const filesLoaded = useRef(false);
+  const filesAt = useRef(0);
+  // 首次扫全桌面要两三秒：这段时间别把「总览 · 0」亮出去，看起来像没有文件
+  const [filesReady, setFilesReady] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
+  // 全桌面文件列表只在真要看总览时才反复扫：本会话压根不读它
+  const loadFiles = useCallback(async () => {
+    const mine = ++fileSeq.current;
     setFileBusy(true);
-    void window.tanwei
-      .taskFiles()
-      .then((list) => {
-        if (!cancelled) setFiles(list);
-      })
-      .catch(() => undefined)
-      .finally(() => {
-        if (!cancelled) setFileBusy(false);
-      });
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const list = await window.tanwei.taskFiles();
+      if (mine !== fileSeq.current) return;
+      setFiles(list);
+      filesLoaded.current = true;
+      filesAt.current = Date.now();
+      setFilesReady(true);
+    } catch {
+      /* 扫桌面失败就保持上一次的列表 */
+    } finally {
+      if (mine === fileSeq.current) setFileBusy(false);
+    }
   }, []);
 
-  const fileTasks = useMemo(() => [...new Set(files.map((f) => f.task))].sort(), [files]);
+  // 本会话档位不读全桌面；切到总览才扫，扫过一次后 15 秒内不因会话事件重扫
+  useEffect(() => {
+    if (fileScope === "session" && filesLoaded.current) return;
+    if (fileScope === "all" && filesLoaded.current && Date.now() - filesAt.current < 15_000) return;
+    void loadFiles();
+  }, [loadFiles, fileScope, ctx.version]);
+
+  const sourceFiles = fileScope === "session" ? ctx.files : files;
+
+  const fileTasks = useMemo(() => [...new Set(sourceFiles.map((f) => f.task))].sort(), [sourceFiles]);
+
+  // 切范围后旧的任务筛选可能已经不在列表里，回落到「全部」而不是给出空结果
+  useEffect(() => {
+    if (fileTask !== "全部" && !fileTasks.includes(fileTask)) setFileTask("全部");
+  }, [fileTasks, fileTask]);
 
   const fileRows = useMemo(() => {
     const q = fileQuery.trim().toLowerCase();
-    return files
+    return sourceFiles
       .filter((f) => fileTask === "全部" || f.task === fileTask)
       .filter((f) => !q || f.name.toLowerCase().includes(q) || f.group.toLowerCase().includes(q) || f.task.toLowerCase().includes(q))
       .slice(0, 400);
-  }, [files, fileTask, fileQuery]);
+  }, [sourceFiles, fileTask, fileQuery]);
 
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -178,15 +203,30 @@ export function Tasks({
               onChange={(e) => setFileQuery(e.target.value)}
             />
           </div>
+          <ScopeSwitch
+            tasks={ctx.tasks}
+            scope={fileScope}
+            onScope={setFileScope}
+            total={filesReady ? files.length : undefined}
+            scoped={ctx.files.length}
+          />
           <select className="input scope-select" value={fileTask} onChange={(e) => setFileTask(e.target.value)}>
-            <option value="全部">全部任务（{files.length}）</option>
+            <option value="全部">全部任务（{sourceFiles.length}）</option>
             {fileTasks.map((t) => (
               <option key={t} value={t}>
                 {t}
               </option>
             ))}
           </select>
-          <span className="subtle">{fileBusy ? "读取中…" : `${fileRows.length} 个文件`}</span>
+          <span className="subtle">
+            {fileScope === "session" && ctx.loading
+              ? "读取中…"
+              : fileBusy
+                ? "读取中…"
+                : fileRows.length < sourceFiles.length
+                  ? `${fileRows.length} / ${sourceFiles.length} 个文件`
+                  : `${fileRows.length} 个文件`}
+          </span>
         </div>
 
         <div className="table file-table">
@@ -198,7 +238,15 @@ export function Tasks({
             <span>更新</span>
           </div>
           {fileRows.length === 0 ? (
-            <div className="module-empty">任务夹里还没有文件，或筛选条件太窄。</div>
+            <div className="module-empty">
+              {fileScope === "session" && ctx.tasks.length === 0
+                ? "这个会话还没认领任务夹。点上面「归属」把桌面上的任务夹勾给它；看全桌面点「总览」。"
+                : fileBusy && !filesReady
+                  ? "正在扫桌面任务夹里的文件，五千多个要两三秒…"
+                  : fileScope === "session"
+                    ? "本会话任务夹里还没有文件，或筛选条件太窄。"
+                    : "任务夹里还没有文件，或筛选条件太窄。"}
+            </div>
           ) : (
             fileRows.map((f) => (
               <button

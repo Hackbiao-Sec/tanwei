@@ -10,10 +10,12 @@ import type {
   SessionState,
   TimelineItem,
   ToolCallView,
+  TurnReport,
   UsageStats,
 } from "../shared/types";
 import { AcpClient, type AcpRequest } from "./acp";
 import { readSessionHistory, readSessionSummary } from "./history";
+import { detectRisk, targetFromInput, type RiskSignal } from "./riskGuard";
 import { readPermissionMode, sanitizeMcpServers } from "./system";
 
 const ZERO_USAGE: UsageStats = {
@@ -26,6 +28,37 @@ const ZERO_USAGE: UsageStats = {
 };
 
 type ActiveItems = { assistant?: string; thought?: string };
+
+/** 一个回合的流式用量追踪：引擎只回整包 usage，回合中先用输出字符估算顶上 */
+type TurnTrack = {
+  base: UsageStats;
+  startedAt: number;
+  startIndex: number;
+  cjk: number;
+  other: number;
+  lastEmit: number;
+  /** 已经收到引擎真实 usage，别再被估算盖回去 */
+  exact: boolean;
+  /** 斜杠命令这类系统指令不推送完成通知 */
+  quiet: boolean;
+};
+
+/** 粗略换算：汉字≈1 token，其余按 3.6 字符≈1 token */
+function estimateTokens(cjk: number, other: number): number {
+  return Math.max(0, Math.round(cjk + other / 3.6));
+}
+
+function stripMarkdown(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]*)`/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s*/gm, "")
+    .replace(/^\s{0,3}[-*+]\s+/gm, "")
+    .replace(/\*\*([^*]*)\*\*/g, "$1")
+    .replace(/[*_>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function now(): number {
   return Date.now();
@@ -109,8 +142,13 @@ export class EngineManager extends EventEmitter {
   private ctxFallback: Record<string, number> = {};
   private compactPercent = 85;
   private commands: CommandInfo[] = [];
+  /** session/load 回放期间不扫风控，否则每次启动都会把历史输出里的旧拦截再发一遍 */
+  private replaying = new Set<string>();
   private mcp = new Map<string, McpServerInfo>();
   private activeItems = new Map<string, ActiveItems>();
+  private turns = new Map<string, TurnTrack>();
+  /** 回合完成卡片：压后一点推，等引擎的真实 usage 落到 state 上，避免卡片显示 0 */
+  private pendingReports = new Map<string, { timer: NodeJS.Timeout; report: TurnReport }>();
   private permissions = new Map<number, { sessionId: string; itemId: string }>();
   private replayUsers = new Map<string, string>();
   private seq = 1;
@@ -120,6 +158,11 @@ export class EngineManager extends EventEmitter {
   private mcpToolCount = 0;
   private lastSessionRefresh = 0;
   private extraEnv: NodeJS.ProcessEnv = {};
+  /** 风控命中回调：由主进程接到通知中心，界面不直接碰 */
+  private riskSink?: (sig: RiskSignal) => void;
+  /** 同会话同类型 5 分钟内只报一次，全局 20 秒内最多一条，避免一次扫描刷满飞书 */
+  private riskSeen = new Map<string, number>();
+  private riskLastAt = 0;
 
   constructor(
     readonly grokPath: string,
@@ -127,6 +170,10 @@ export class EngineManager extends EventEmitter {
   ) {
     super();
     this.mode = readPermissionMode();
+  }
+
+  setRiskSink(fn: (sig: RiskSignal) => void): void {
+    this.riskSink = fn;
   }
 
   /** 代理等附加环境变量；下次 start/restart 才生效 */
@@ -234,6 +281,8 @@ export class EngineManager extends EventEmitter {
   }
 
   stop(): void {
+    for (const pending of this.pendingReports.values()) clearTimeout(pending.timer);
+    this.pendingReports.clear();
     this.client?.stop();
     this.client = null;
     this.status = "stopped";
@@ -254,6 +303,7 @@ export class EngineManager extends EventEmitter {
     this.activeItems.clear();
     this.permissions.clear();
     this.replayUsers.clear();
+    this.replaying.clear();
     this.agentVersion = undefined;
     this.status = "stopped";
     this.emitEvent({ type: "reset" });
@@ -366,6 +416,7 @@ export class EngineManager extends EventEmitter {
     this.order.unshift(id);
     this.emitEvent({ type: "session", session: structuredClone(state) });
 
+    this.replaying.add(id);
     try {
       const resp = await this.client.request(
         "session/load",
@@ -405,6 +456,9 @@ export class EngineManager extends EventEmitter {
         text: `载入会话失败：${err instanceof Error ? err.message : String(err)}`,
       });
       return state;
+    } finally {
+      // 回放通知基本随 session/load 一起到，响应后再留一点余量给补全
+      setTimeout(() => this.replaying.delete(id), 4000);
     }
   }
 
@@ -415,9 +469,12 @@ export class EngineManager extends EventEmitter {
     const trimmed = text.trim();
     if (!trimmed) return;
 
+    // 用户亲自发话，后面收到的一律是本次实测结果
+    this.replaying.delete(sessionId);
     this.closeActive(sessionId, "assistant");
     this.closeActive(sessionId, "thought");
     state.timeline.push({ type: "user", id: `i${this.seq++}`, text: trimmed, at: now() });
+    this.beginTurn(sessionId, trimmed);
     state.busy = true;
     state.updatedAt = now();
     this.emitEvent({ type: "item", sessionId, item: state.timeline[state.timeline.length - 1] });
@@ -437,28 +494,34 @@ export class EngineManager extends EventEmitter {
       const meta = result?._meta;
       const u = meta?.usage ?? meta;
       if (u && Number(u.totalTokens) > 0) {
-        state.usage = {
-          inputTokens: Number(u.inputTokens ?? 0),
-          outputTokens: Number(u.outputTokens ?? 0),
-          cacheReadTokens: Number(u.cachedReadTokens ?? u.cacheReadTokens ?? 0),
-          cacheWriteTokens: Number(u.cacheCreationTokens ?? u.cacheWriteTokens ?? 0),
-          reasoningTokens: Number(u.reasoningTokens ?? 0),
-          totalTokens: Number(u.totalTokens ?? 0),
-          costUsd: state.usage.costUsd,
-        };
         const modelId = meta?.modelId ? String(meta.modelId) : state.model;
-        this.emitEvent({ type: "meta", sessionId, patch: { usage: state.usage, model: modelId } });
+        this.applyUsage(
+          sessionId,
+          {
+            inputTokens: Number(u.inputTokens ?? 0),
+            outputTokens: Number(u.outputTokens ?? 0),
+            cacheReadTokens: Number(u.cachedReadTokens ?? u.cacheReadTokens ?? 0),
+            cacheWriteTokens: Number(u.cacheCreationTokens ?? u.cacheWriteTokens ?? 0),
+            reasoningTokens: Number(u.reasoningTokens ?? 0),
+            totalTokens: Number(u.totalTokens ?? 0),
+            costUsd: state.usage.costUsd,
+          },
+          { model: modelId },
+        );
       }
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // 引擎自身报的 429 / 频控也算被风控，那条链路断了整轮都跑不动
+      this.scanRisk(sessionId, message, { title: "引擎 / 模型接口" });
       this.emitEvent({
         type: "notice",
         level: "error",
-        text: `发送失败：${err instanceof Error ? err.message : String(err)}`,
+        text: `发送失败：${message}`,
       });
       state.timeline.push({
         type: "system",
         id: `i${this.seq++}`,
-        text: `发送失败：${err instanceof Error ? err.message : String(err)}`,
+        text: `发送失败：${message}`,
         at: now(),
         level: "error",
       });
@@ -470,6 +533,45 @@ export class EngineManager extends EventEmitter {
 
   async cancel(sessionId: string): Promise<void> {
     this.client?.notify("session/cancel", { sessionId });
+  }
+
+  /**
+   * 删磁盘前先让引擎卸载会话：加载过的会话，引擎会一直握着目录里的文件句柄，
+   * Windows 上这时删目录会 EPERM。引擎没加载过这个会话时 close 会报错，忽略即可。
+   */
+  async closeSession(sessionId: string): Promise<void> {
+    if (this.sessions.get(sessionId)?.busy) this.client?.notify("session/cancel", { sessionId });
+    if (this.client?.alive) {
+      try {
+        await this.client.request("session/close", { sessionId }, 5_000);
+      } catch {
+        /* 没加载过 / 引擎版本不认这个方法，继续删 */
+      }
+    }
+    this.dropSession(sessionId);
+  }
+
+  /**
+   * 会话被删除：正在跑的回合先取消，再把内存里的句柄和逐项状态清掉。
+   * 引擎随后还会给这个 id 发 session/update，各处理函数都会因为找不到 state 直接返回。
+   */
+  dropSession(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (state?.busy) this.client?.notify("session/cancel", { sessionId });
+    this.sessions.delete(sessionId);
+    this.order = this.order.filter((id) => id !== sessionId);
+    this.activeItems.delete(sessionId);
+    this.replayUsers.delete(sessionId);
+    this.replaying.delete(sessionId);
+    this.turns.delete(sessionId);
+    for (const [requestId, owner] of [...this.permissions.entries()]) {
+      if (owner.sessionId === sessionId) this.permissions.delete(requestId);
+    }
+    const pending = this.pendingReports.get(sessionId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingReports.delete(sessionId);
+    }
   }
 
   async setModel(sessionId: string, modelId: string): Promise<void> {
@@ -753,7 +855,7 @@ export class EngineManager extends EventEmitter {
       }
       case "response_completed": {
         if (update.usage) {
-          state.usage = {
+          this.applyUsage(sessionId, {
             inputTokens: Number(update.usage.input_tokens ?? 0),
             outputTokens: Number(update.usage.output_tokens ?? 0),
             cacheReadTokens: Number(update.usage.cache_read_input_tokens ?? 0),
@@ -764,8 +866,7 @@ export class EngineManager extends EventEmitter {
               Number(update.usage.output_tokens ?? 0) +
               Number(update.usage.cache_read_input_tokens ?? 0) +
               Number(update.usage.cache_creation_input_tokens ?? 0),
-          };
-          this.emitEvent({ type: "meta", sessionId, patch: { usage: state.usage } });
+          });
         }
         break;
       }
@@ -773,15 +874,14 @@ export class EngineManager extends EventEmitter {
         const u = update.usage;
         const total = Number(u?.totalTokens ?? u?.total_tokens ?? 0);
         if (u && total > 0) {
-          state.usage = {
+          this.applyUsage(sessionId, {
             inputTokens: Number(u.inputTokens ?? u.input_tokens ?? 0),
             outputTokens: Number(u.outputTokens ?? u.output_tokens ?? 0),
             cacheReadTokens: Number(u.cachedReadTokens ?? u.cache_read_input_tokens ?? 0),
             cacheWriteTokens: Number(u.cacheCreationTokens ?? u.cache_creation_input_tokens ?? 0),
             reasoningTokens: Number(u.reasoningTokens ?? u.reasoning_tokens ?? 0),
             totalTokens: total,
-          };
-          this.emitEvent({ type: "meta", sessionId, patch: { usage: state.usage } });
+          });
         }
         this.finishTurn(sessionId);
         break;
@@ -872,6 +972,7 @@ export class EngineManager extends EventEmitter {
     }
     (item as any).text += text;
     this.emitEvent({ type: "delta", sessionId, itemId: itemId!, kind, text });
+    this.noteStream(sessionId, text);
   }
 
   private closeActive(sessionId: string, kind: "assistant" | "thought"): void {
@@ -886,6 +987,73 @@ export class EngineManager extends EventEmitter {
     delete active[kind];
   }
 
+  /** 回合开始：快照当前累计用量，后面只在本轮增量上做估算 */
+  private beginTurn(sessionId: string, text: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    // 上一回合还没推的完成卡片，先按当前用量推掉，别被新回合吞掉
+    this.flushTurnReport(sessionId);
+    this.turns.set(sessionId, {
+      base: { ...state.usage },
+      startedAt: Date.now(),
+      startIndex: state.timeline.length,
+      cjk: 0,
+      other: 0,
+      lastEmit: 0,
+      exact: false,
+      quiet: /^\s*\/[a-z-]+/i.test(text),
+    });
+    if (state.usageEstimated) {
+      state.usageEstimated = false;
+      this.emitEvent({ type: "meta", sessionId, patch: { usageEstimated: false } });
+    }
+  }
+
+  /** 流式阶段按输出字符估算本轮用量，节流推送，避免计数一直不动再突然跳 */
+  private noteStream(sessionId: string, text: string): void {
+    const turn = this.turns.get(sessionId);
+    const state = this.sessions.get(sessionId);
+    if (!turn || !state) return;
+    for (const ch of text) {
+      const code = ch.codePointAt(0) ?? 0;
+      // 中日韩 + 全角标点按整 token 估
+      if ((code >= 0x2e80 && code <= 0x9fff) || (code >= 0xac00 && code <= 0xd7af) || (code >= 0xf900 && code <= 0xfaff) || (code >= 0xff00 && code <= 0xffef)) {
+        turn.cjk += 1;
+      } else {
+        turn.other += 1;
+      }
+    }
+    if (turn.exact) return;
+    const t = Date.now();
+    if (t - turn.lastEmit < 600) return;
+    turn.lastEmit = t;
+    const est = estimateTokens(turn.cjk, turn.other);
+    if (est <= 0) return;
+    const usage: UsageStats = {
+      ...turn.base,
+      outputTokens: turn.base.outputTokens + est,
+      totalTokens: turn.base.totalTokens + est,
+    };
+    state.usage = usage;
+    state.usageEstimated = true;
+    this.emitEvent({ type: "meta", sessionId, patch: { usage, usageEstimated: true } });
+  }
+
+  /** 引擎回了真实用量：覆盖估算并清掉标记，之后的估算不再盖回来 */
+  private applyUsage(sessionId: string, usage: UsageStats, extra?: Partial<SessionState>): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.usage = usage;
+    state.usageEstimated = false;
+    const turn = this.turns.get(sessionId);
+    if (turn) turn.exact = true;
+    this.emitEvent({
+      type: "meta",
+      sessionId,
+      patch: { ...(extra ?? {}), usage, usageEstimated: false },
+    });
+  }
+
   private finishTurn(sessionId: string): void {
     const state = this.sessions.get(sessionId);
     if (!state) return;
@@ -896,6 +1064,83 @@ export class EngineManager extends EventEmitter {
       state.updatedAt = now();
       this.emitEvent({ type: "meta", sessionId, patch: { busy: false, updatedAt: state.updatedAt } });
     }
+
+    const turn = this.turns.get(sessionId);
+    if (!turn) return;
+    this.turns.delete(sessionId);
+    if (state.usageEstimated) {
+      state.usageEstimated = false;
+      this.emitEvent({ type: "meta", sessionId, patch: { usageEstimated: false } });
+    }
+    if (turn.quiet) return;
+
+    const tools = state.timeline
+      .slice(turn.startIndex)
+      .filter((i): i is Extract<TimelineItem, { type: "tool" }> => i.type === "tool");
+    const failedTools = tools.filter((i) => i.call.status === "failed").length;
+    let excerpt = "";
+    for (let i = state.timeline.length - 1; i >= turn.startIndex; i -= 1) {
+      const item = state.timeline[i];
+      if (item.type === "assistant" && item.text.trim()) {
+        excerpt = stripMarkdown(item.text).slice(0, 160);
+        break;
+      }
+    }
+    const report: TurnReport = {
+      sessionId,
+      title: state.title || "会话",
+      durationMs: Math.max(0, Date.now() - turn.startedAt),
+      toolCount: tools.length,
+      failedTools,
+      usage: state.usage,
+      excerpt,
+    };
+    // 引擎的整包 usage 有时比 prompt 回包晚到几十毫秒，压后一点再推，卡片里才不会写 0
+    this.pendingReports.set(sessionId, {
+      timer: setTimeout(() => this.flushTurnReport(sessionId), 900),
+      report,
+    });
+  }
+
+  /** 推出回合完成卡片；用量取此刻的真实值 */
+  private flushTurnReport(sessionId: string): void {
+    const pending = this.pendingReports.get(sessionId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingReports.delete(sessionId);
+    const state = this.sessions.get(sessionId);
+    this.emitEvent({
+      type: "turn-done",
+      report: { ...pending.report, usage: state?.usage ?? pending.report.usage },
+    });
+  }
+
+  /**
+   * 工具输出里认出「被目标拦住」就上交一次。
+   * 渗透过程中的证据全在工具输出里，这里只读结果，不插手 agent 怎么打。
+   */
+  private scanRisk(sessionId: string, text: string, extra?: { input?: unknown; title?: string }): void {
+    if (!this.riskSink || !text) return;
+    // session/load 会把历史工具输出重放一遍，那是几小时前的旧结果，不能当成本次实测被拦
+    if (this.replaying.has(sessionId)) return;
+    const hit = detectRisk(text);
+    if (!hit) return;
+    const t = now();
+    if (t - this.riskLastAt < 20_000) return;
+    const key = `${sessionId}:${hit.category}`;
+    if (t - (this.riskSeen.get(key) ?? 0) < 5 * 60_000) return;
+    this.riskSeen.set(key, t);
+    this.riskLastAt = t;
+    const state = this.sessions.get(sessionId);
+    const target = targetFromInput(extra?.input) ?? targetFromInput(extra?.title);
+    this.riskSink({
+      sessionId,
+      category: hit.category,
+      evidence: hit.evidence,
+      target,
+      task: state?.title || state?.cwd || "",
+      at: t,
+    });
   }
 
   private upsertTool(sessionId: string, update: any): void {
@@ -947,6 +1192,7 @@ export class EngineManager extends EventEmitter {
     if (status === "completed" || status === "failed") {
       state.updatedAt = now();
     }
+    if (output) this.scanRisk(sessionId, output, { input, title });
   }
 
   /** 仅用于自检：伪造一张权限卡，走与真实请求相同的渲染/应答路径 */

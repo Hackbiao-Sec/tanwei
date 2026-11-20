@@ -1,15 +1,21 @@
 import { app, net, session } from "electron";
 import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { probeCredentialedProxy } from "./proxyProbe";
 import type {
+  ClashNode,
+  ClashProfile,
   ProxyEntry,
   ProxyFreeResult,
   ProxyImportResult,
   ProxyImportStats,
   ProxyLocalPort,
   ProxyPool,
+  ProxyRotation,
   ProxySource,
+  ProxySpeedResult,
 } from "../shared/types";
 
 /**
@@ -50,6 +56,25 @@ const FREE_SOURCES: { url: string; scheme: "http" | "socks5" }[] = [
 
 const DEFAULT_POOL: ProxyPool = { entries: [], rotate: false };
 
+const DEFAULT_ROTATION: ProxyRotation = {
+  enabled: false,
+  intervalSec: 300,
+  mode: "smart",
+  onBan: true,
+  restartEngine: false,
+};
+
+/** 付费配置导入时给每条打上的来源名：文件名本身，方便界面按供应商分组 */
+function providerName(source: ProxySource, origin: string): string {
+  if (source === "free") return "免费源";
+  if (source === "manual") {
+    if (!origin) return "手动添加";
+    return origin === "paste" ? "粘贴导入" : path.basename(origin);
+  }
+  const base = origin ? path.basename(origin) : "";
+  return base || "配置文件";
+}
+
 export function poolPath(): string {
   return path.join(app.getPath("userData"), "proxy-pool.json");
 }
@@ -75,19 +100,80 @@ export function readPool(): ProxyPool {
         url,
         label: typeof item?.label === "string" && item.label ? item.label : undefined,
         source: normalizeSource(item?.source),
+        provider: typeof item?.provider === "string" && item.provider ? item.provider : undefined,
         enabled: item?.enabled !== false,
         health: normalizeHealth(item?.health),
         latencyMs: typeof item?.latencyMs === "number" ? item.latencyMs : undefined,
         checkedAt: typeof item?.checkedAt === "number" ? item.checkedAt : undefined,
+        speedKbps: typeof item?.speedKbps === "number" ? item.speedKbps : undefined,
+        speedAt: typeof item?.speedAt === "number" ? item.speedAt : undefined,
+        failCount: typeof item?.failCount === "number" ? item.failCount : undefined,
         error: typeof item?.error === "string" ? item.error : undefined,
       });
     }
     const activeId = entries.some((e) => e.id === raw?.activeId) ? String(raw.activeId) : undefined;
-    return { entries, activeId, rotate: raw?.rotate === true, updatedAt: raw?.updatedAt };
+    const rotation = normalizeRotation(raw?.rotation);
+    return {
+      entries,
+      activeId,
+      rotate: raw?.rotate === true,
+      rotation,
+      clash: normalizeClash(raw?.clash),
+      updatedAt: raw?.updatedAt,
+    };
   } catch {
-    return { ...DEFAULT_POOL };
+    return { ...DEFAULT_POOL, rotation: { ...DEFAULT_ROTATION } };
   }
 }
+
+/** 订阅里塞的「剩余流量 / 套餐到期 / 请升级客户端」是占位行，不算出口节点 */
+const NOTICE_NODE = /(剩余流量|套餐|到期|官网|教程|版本|客服|群组|订阅|重置|升级)/;
+
+/** 关掉再开、换台机器回来，节点池和控制口都还得在 */
+function normalizeClash(raw: any): ClashProfile | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const nodes: ClashNode[] = [];
+  const seen = new Set<string>();
+  for (const item of Array.isArray(raw.nodes) ? raw.nodes : []) {
+    const name = typeof item?.name === "string" ? item.name.trim() : "";
+    if (!name || seen.has(name) || nodes.length >= 5000) continue;
+    seen.add(name);
+    nodes.push({
+      name,
+      type: typeof item?.type === "string" ? item.type : "unknown",
+      server: typeof item?.server === "string" ? item.server : undefined,
+      port: typeof item?.port === "number" ? item.port : undefined,
+    });
+  }
+  const controller = typeof raw.controller === "string" && raw.controller ? String(raw.controller) : undefined;
+  if (!nodes.length && !controller) return undefined;
+  return {
+    controller,
+    secret: typeof raw.secret === "string" && raw.secret ? String(raw.secret) : undefined,
+    nodes,
+    group: typeof raw.group === "string" && raw.group ? String(raw.group) : undefined,
+    port: Number.isInteger(raw.port) && raw.port > 0 && raw.port <= 65535 ? raw.port : undefined,
+    scheme: raw.scheme === "socks5" ? "socks5" : raw.scheme === "http" ? "http" : undefined,
+    selected: typeof raw.selected === "string" && raw.selected ? String(raw.selected) : undefined,
+    switchedAt: typeof raw.switchedAt === "number" ? raw.switchedAt : undefined,
+    error: typeof raw.error === "string" ? raw.error : undefined,
+    from: typeof raw.from === "string" ? raw.from : undefined,
+  };
+}
+
+function normalizeRotation(raw: any): ProxyRotation {
+  const mode = raw?.mode === "interval" || raw?.mode === "fastest" ? raw.mode : "smart";
+  const interval = Number(raw?.intervalSec);
+  return {
+    enabled: raw?.enabled === true,
+    intervalSec: Number.isFinite(interval) ? Math.min(Math.max(Math.round(interval), 30), 86_400) : 300,
+    mode,
+    onBan: raw?.onBan !== false,
+    restartEngine: raw?.restartEngine === true,
+    lastRotatedAt: typeof raw?.lastRotatedAt === "number" ? raw.lastRotatedAt : undefined,
+  };
+}
+
 
 function writePool(pool: ProxyPool): ProxyPool {
   const next: ProxyPool = { ...pool, updatedAt: Date.now() };
@@ -205,6 +291,10 @@ interface ClashScan {
   notes: string[];
   /** 命中过 proxies 块或本机端口，说明这确实是一份客户端配置 */
   structured: boolean;
+  /** 全部节点（含 Electron 拨不了的），切 Clash 节点时要用 */
+  clashNodes: ClashNode[];
+  controller?: string;
+  secret?: string;
 }
 
 /** 去掉行尾注释；引号里的 # 不当注释（ss 的 password 里可能就有） */
@@ -312,8 +402,17 @@ function applyNodeField(draft: NodeDraft, rawKey: string, value: string): void {
  * 记进清单，交给本机 Clash 已经在跑的 mixed-port 当出口。
  */
 function scanClashConfig(body: string): ClashScan {
-  const scan: ClashScan = { tokens: [], usable: {}, nodes: {}, localPorts: [], notes: [], structured: false };
+  const scan: ClashScan = {
+    tokens: [],
+    usable: {},
+    nodes: {},
+    localPorts: [],
+    notes: [],
+    structured: false,
+    clashNodes: [],
+  };
   const seen = new Set<string>();
+  const seenNode = new Set<string>();
   let draft: NodeDraft | null = null;
   let inProxies = false;
   let flow = "";
@@ -327,6 +426,14 @@ function scanClashConfig(body: string): ClashScan {
     const port = (node.port ?? "").trim();
     if (!hostOk(server) || !portOk(port)) return;
     const type = (node.type ?? "").toLowerCase();
+    // 组类型不是出口节点，别当节点登记
+    if (type === "select" || type === "selector" || type === "url-test" || type === "fallback" || type === "load-balance")
+      return;
+    const name = (node.name ?? "").trim() || `${server}:${port}`;
+    if (scan.clashNodes.length < 5000 && !seenNode.has(name)) {
+      seenNode.add(name);
+      scan.clashNodes.push({ name, type: type || "unknown", server, port: Number(port) });
+    }
     const scheme = DIAL_TYPES[type] ?? "";
     if (!scheme) {
       const key = type || "unknown";
@@ -390,8 +497,20 @@ function scanClashConfig(body: string): ClashScan {
       const key = top[1].toLowerCase();
       const value = top[2].trim();
       finish();
-      inProxies = key === "proxies" && !value;
+      // 老版 Clash 配置把节点写在 Proxy: 下，新版是 proxies:
+      inProxies = (key === "proxies" || key === "proxy") && !value;
       if (inProxies || key === "proxy-providers") scan.structured = true;
+      if (key === "external-controller") {
+        const ctl = unquoteYaml(value).replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+        if (ctl) {
+          scan.controller = ctl;
+          scan.structured = true;
+        }
+      }
+      if (key === "secret") {
+        const secret = unquoteYaml(value);
+        if (secret) scan.secret = secret;
+      }
       if (key === "proxies" && value.startsWith("[")) {
         if (flowBalance(value) > 0) {
           flow = value;
@@ -528,6 +647,14 @@ function parseProxyTextDepth(
       stats.nodes = { ...scan.nodes };
       stats.localPorts = [...scan.localPorts];
       stats.notes = [...scan.notes];
+      const local = pickLocalPort(scan.localPorts);
+      stats.clash = {
+        controller: scan.controller,
+        secret: scan.secret,
+        nodes: scan.clashNodes,
+        port: local?.port,
+        scheme: local?.scheme,
+      };
       return { tokens, skipped, stats };
     }
   }
@@ -624,8 +751,14 @@ function uniqueById(pool: ProxyPool): ProxyEntry[] {
   return [...byUrl.values()];
 }
 
-function mergeEntries(pool: ProxyPool, tokens: ParsedToken[], source: ProxySource): { pool: ProxyPool; addedIds: string[] } {
+function mergeEntries(
+  pool: ProxyPool,
+  tokens: ParsedToken[],
+  source: ProxySource,
+  origin = "",
+): { pool: ProxyPool; addedIds: string[] } {
   const existing = new Map(pool.entries.map((e) => [e.url.toLowerCase(), e]));
+  const provider = providerName(source, origin);
   const added: ProxyEntry[] = [];
   for (const token of tokens) {
     if (existing.size + added.length >= MAX_ENTRIES) break;
@@ -637,6 +770,7 @@ function mergeEntries(pool: ProxyPool, tokens: ParsedToken[], source: ProxySourc
       url: token.url,
       label: token.label,
       source,
+      provider,
       enabled: true,
       health: "unknown",
     };
@@ -644,7 +778,13 @@ function mergeEntries(pool: ProxyPool, tokens: ParsedToken[], source: ProxySourc
   }
   const entries = uniqueById({ ...pool, entries: [...pool.entries, ...added] });
   return {
-    pool: writePool({ entries, activeId: pool.activeId, rotate: pool.rotate }),
+    pool: writePool({
+      entries,
+      activeId: pool.activeId,
+      rotate: pool.rotate,
+      rotation: pool.rotation,
+      clash: pool.clash,
+    }),
     addedIds: added.map((e) => e.id),
   };
 }
@@ -659,6 +799,216 @@ function localPortTokens(stats: ProxyImportStats): ParsedToken[] {
   return out;
 }
 
+/** mixed-port 优先：它同时吃 http 和 socks，切节点时引擎走它最稳 */
+function pickLocalPort(ports: ProxyLocalPort[]): ProxyLocalPort | undefined {
+  for (const key of ["mixed-port", "port", "http-port", "socks-port"]) {
+    const hit = ports.find((p) => p.key === key);
+    if (hit) return hit;
+  }
+  return ports[0];
+}
+
+/** 本机 Clash 客户端习惯把控制口写在运行配置里，订阅文件本身常常没有 */
+function controllerCandidates(near?: string): string[] {
+  const list: string[] = [];
+  const push = (file: string | undefined) => {
+    if (!file) return;
+    if (!list.includes(file)) list.push(file);
+  };
+  if (near) {
+    const dir = path.dirname(near);
+    for (const name of ["config.yaml", "config.yml", "clash.yaml", "clash-verge.yaml"]) {
+      push(path.join(dir, name));
+      push(path.join(path.dirname(dir), name));
+      push(path.join(dir, "profiles", name));
+    }
+  }
+  const home = os.homedir();
+  for (const name of ["config.yaml", "config.yml"]) {
+    push(path.join(home, ".config", "clash", name));
+    push(path.join(home, ".config", "mihomo", name));
+    push(path.join(home, ".config", "clash-verge", name));
+  }
+  const appData = process.env.APPDATA;
+  if (appData) {
+    push(path.join(appData, "io.github.clash-verge-rev.clash-verge-rev", "clash-verge.yaml"));
+    push(path.join(appData, "io.github.clash-verge-rev.clash-verge-rev", "config.yaml"));
+    push(path.join(appData, "clash-verge", "config.yaml"));
+    push(path.join(appData, "Clash for Windows", "profiles", "config.yaml"));
+  }
+  return list;
+}
+
+/** 从客户端运行配置里抠出 external-controller / secret / 本机端口；只读前 2 MB，不整份解析 */
+function readControllerFrom(file: string): {
+  controller?: string;
+  secret?: string;
+  port?: number;
+  scheme?: "http" | "socks5";
+} {
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile() || stat.size > 4 * 1024 * 1024) return {};
+    const text = fs.readFileSync(file, "utf8").slice(0, 2 * 1024 * 1024);
+    const ctl = text.match(/^\s*external-controller:\s*["']?([^"'\r\n#]+)/m);
+    const secret = text.match(/^\s*secret:\s*["']?([^"'\r\n#]+)/m);
+    // 顶层端口写在行首，proxies 里的 port 有缩进，不会误撞
+    const mixed = text.match(/^mixed-port:\s*["']?(\d{1,5})/m);
+    const http = text.match(/^port:\s*["']?(\d{1,5})/m);
+    const socks = text.match(/^socks-port:\s*["']?(\d{1,5})/m);
+    const hit = mixed ?? http ?? socks;
+    const port = hit ? Number(hit[1]) : undefined;
+    return {
+      controller: ctl ? ctl[1].trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "") : undefined,
+      secret: secret ? secret[1].trim() : undefined,
+      port: Number.isInteger(port) && port && port > 0 && port <= 65535 ? port : undefined,
+      scheme: !mixed && !http && socks ? "socks5" : "http",
+    };
+  } catch {
+    return {};
+  }
+}
+
+/** 订阅文件里没写控制口 / 本机端口时，去本机 Clash 的运行配置里找 */
+function resolveController(
+  imported: ClashProfile | undefined,
+  near?: string,
+): { controller?: string; secret?: string; port?: number; scheme?: "http" | "socks5"; from?: string } {
+  const own = { controller: imported?.controller, secret: imported?.secret, port: imported?.port, scheme: imported?.scheme };
+  if (imported?.controller && imported?.port) return { ...own, from: near };
+  for (const file of controllerCandidates(near)) {
+    const found = readControllerFrom(file);
+    if (found.controller || found.port) {
+      return {
+        controller: own.controller || found.controller,
+        secret: own.secret || found.secret,
+        port: own.port || found.port,
+        scheme: own.scheme || found.scheme,
+        from: file,
+      };
+    }
+  }
+  return { ...own, from: near };
+}
+
+/** /version 是最便宜的控制口连通性检查，不拉节点表 */
+function probeController(controller: string, secret?: string, timeoutMs = 1200): Promise<boolean> {
+  return new Promise((resolve) => {
+    let url: URL;
+    try {
+      url = new URL(/^https?:\/\//i.test(controller) ? controller : `http://${controller}`);
+    } catch {
+      resolve(false);
+      return;
+    }
+    const headers: Record<string, string> = {};
+    if (secret) headers.Authorization = `Bearer ${secret}`;
+    const req = http.request(
+      {
+        host: url.hostname,
+        port: Number(url.port || 80),
+        method: "GET",
+        path: "/version",
+        headers,
+        timeout: timeoutMs,
+      },
+      (res) => {
+        res.resume();
+        const status = res.statusCode ?? 0;
+        resolve(status >= 200 && status < 300);
+      },
+    );
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.on("error", () => resolve(false));
+    req.end();
+  });
+}
+
+/**
+ * 订阅文件里的 external-controller 常常是模板默认值（9090），真正在跑的客户端把地址写在运行配置里。
+ * 按「当前填的 → 本机运行配置里读到的 → 常见默认口」依次探活，第一个连得上的写回池里，
+ * 这样导入完不用手工去改端口，风控轮换也才真的能切。
+ */
+export async function healClashController(): Promise<{
+  pool: ProxyPool;
+  changed: boolean;
+  controller?: string;
+  secret?: string;
+  from?: string;
+}> {
+  const pool = readPool();
+  const profile = pool.clash;
+  if (!profile) return { pool, changed: false };
+  const candidates: { controller: string; secret?: string; from?: string }[] = [];
+  const push = (controller?: string, secret?: string, from?: string) => {
+    const clean = (controller ?? "").trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    if (!clean) return;
+    if (candidates.some((c) => c.controller === clean && c.secret === secret)) return;
+    candidates.push({ controller: clean, secret, from });
+  };
+  push(profile.controller, profile.secret, profile.from);
+  for (const file of controllerCandidates(profile.from)) {
+    const found = readControllerFrom(file);
+    push(found.controller, found.secret, file);
+    // 订阅里只有地址、secret 在客户端配置里时，用客户端那份再试一次
+    push(found.controller, profile.secret, file);
+  }
+  for (const fallback of ["127.0.0.1:9090", "127.0.0.1:9091", "127.0.0.1:9097"]) {
+    push(fallback, profile.secret, profile.from);
+  }
+  for (const item of candidates) {
+    const secrets = [...new Set([item.secret, profile.secret].filter((s): s is string => Boolean(s)))];
+    const attempt = secrets.length ? secrets : [undefined];
+    for (const secret of attempt) {
+      if (!(await probeController(item.controller, secret))) continue;
+      if (item.controller === profile.controller && secret === profile.secret) {
+        return { pool, changed: false, controller: item.controller, secret, from: item.from };
+      }
+      const next = setClashProfile({
+        controller: item.controller,
+        secret,
+        from: item.from ?? profile.from,
+        error: undefined,
+      });
+      return { pool: next, changed: true, controller: item.controller, secret, from: item.from };
+    }
+  }
+  return { pool, changed: false };
+}
+
+/** 导入时把新读到的节点并进已有池；同名节点只留一份，控制口和当前选中不被覆盖成空 */
+function mergeClashProfile(pool: ProxyPool, imported: ClashProfile | undefined, from: string): ClashProfile | undefined {
+  const prev = pool.clash;
+  if (!imported && !prev) return undefined;
+  const nodes: ClashNode[] = [];
+  const seen = new Set<string>();
+  for (const node of [...(prev?.nodes ?? []), ...(imported?.nodes ?? [])]) {
+    if (!node?.name || seen.has(node.name) || nodes.length >= 5000) continue;
+    // 订阅里塞的「剩余流量 / 套餐到期 / 请升级客户端」是占位行，留着只会被当成出口
+    if (NOTICE_NODE.test(node.name)) continue;
+    seen.add(node.name);
+    nodes.push(node);
+  }
+  const resolved = resolveController(imported, from);
+  const controller = resolved.controller || prev?.controller;
+  if (!nodes.length && !controller) return undefined;
+  return {
+    controller,
+    secret: resolved.secret || prev?.secret,
+    nodes,
+    group: imported?.group || prev?.group,
+    port: resolved.port || prev?.port,
+    scheme: resolved.scheme || prev?.scheme,
+    selected: imported?.selected || prev?.selected,
+    switchedAt: prev?.switchedAt,
+    error: prev?.error,
+    from: resolved.from || prev?.from || from,
+  };
+}
+
 function commitImport(
   tokens: ParsedToken[],
   source: ProxySource,
@@ -667,8 +1017,14 @@ function commitImport(
   stats: ProxyImportStats,
 ): ProxyImportResult {
   const all = [...tokens, ...localPortTokens(stats)];
-  const { pool, addedIds } = mergeEntries(readPool(), all, source);
-  return { pool, added: addedIds.length, addedIds, skipped, source: sourceLabel, stats };
+  // origin 决定「付费配置文件名」这个分组名，粘贴导入走 paste 分支
+  const base = readPool();
+  const { pool, addedIds } = mergeEntries(base, all, source, sourceLabel);
+  const clash = mergeClashProfile(base, stats.clash, sourceLabel);
+  const written = clash ? writePool({ ...pool, clash }) : pool;
+  // 订阅里有本机端口就把当前出口钉到它：之后切节点才算真的换出口
+  const finalPool = clash?.port ? ensureClashActive().pool : written;
+  return { pool: finalPool, added: addedIds.length, addedIds, skipped, source: sourceLabel, stats };
 }
 
 function emptyParseMessage(stats: ProxyImportStats): string {
@@ -679,18 +1035,28 @@ function emptyParseMessage(stats: ProxyImportStats): string {
   return "没有认出代理地址：认 host:port、host:port:user:pass、scheme://user:pass@host:port、Clash YAML、JSON、CSV；别的格式交给「AI 解析」";
 }
 
+/** 订阅文件里没写 mixed-port 也能收：节点池靠本机客户端的控制口切，照样能轮换 */
+function hasClashTarget(stats: ProxyImportStats): boolean {
+  const clash = stats.clash;
+  return Boolean(clash && (clash.nodes?.length || clash.controller));
+}
+
 export function importProxyFile(file: string): ProxyImportResult {
   const stat = fs.statSync(file);
   if (stat.size > MAX_IMPORT_BYTES) throw new Error("配置文件超过 6 MB，先裁一下再导入");
   const text = fs.readFileSync(file, "utf8");
   const { tokens, skipped, stats } = parseProxyText(text);
-  if (!tokens.length && !stats.localPorts.length) throw new Error(emptyParseMessage(stats));
+  if (!tokens.length && !stats.localPorts.length && !hasClashTarget(stats)) {
+    throw new Error(emptyParseMessage(stats));
+  }
   return commitImport(tokens, "config", file, skipped, stats);
 }
 
 export function importProxyText(text: string): ProxyImportResult {
   const { tokens, skipped, stats } = parseProxyText(text);
-  if (!tokens.length && !stats.localPorts.length) throw new Error(emptyParseMessage(stats));
+  if (!tokens.length && !stats.localPorts.length && !hasClashTarget(stats)) {
+    throw new Error(emptyParseMessage(stats));
+  }
   return commitImport(tokens, "manual", "paste", skipped, stats);
 }
 
@@ -740,8 +1106,125 @@ export function setPoolRotate(rotate: boolean): ProxyPool {
   return writePool({ ...readPool(), rotate });
 }
 
+/** 自动换代理的配置；只改传进来的那几项 */
+export function setPoolRotation(patch: Partial<ProxyRotation>): ProxyPool {
+  const pool = readPool();
+  const rotation = normalizeRotation({ ...DEFAULT_ROTATION, ...pool.rotation, ...patch });
+  return writePool({ ...pool, rotation });
+}
+
+/** 记录 Clash 控制口 / 当前节点 / 上次切换结果；只改传进来的那几项 */
+export function setClashProfile(patch: Partial<ClashProfile>): ProxyPool {
+  const pool = readPool();
+  const base = pool.clash;
+  const merged: ClashProfile = {
+    nodes: patch.nodes ?? base?.nodes ?? [],
+    controller: patch.controller ?? base?.controller,
+    secret: patch.secret ?? base?.secret,
+    group: patch.group ?? base?.group,
+    port: patch.port ?? base?.port,
+    scheme: patch.scheme ?? base?.scheme,
+    selected: patch.selected ?? base?.selected,
+    switchedAt: patch.switchedAt ?? base?.switchedAt,
+    error: "error" in patch ? patch.error : base?.error,
+    from: patch.from ?? base?.from,
+  };
+  return writePool({ ...pool, clash: merged });
+}
+
+/** 清空节点池（换订阅、换客户端时用） */
+export function clearClashProfile(): ProxyPool {
+  const pool = readPool();
+  const { clash: _drop, ...rest } = pool;
+  return writePool({ ...rest });
+}
+
+/**
+ * Clash 模式下引擎必须走本机端口，切节点才等于换出口。
+ * 池里没这条就补一条，当前选中不是它就改过来。
+ */
+export function ensureClashActive(): { pool: ProxyPool; changed: boolean; url?: string } {
+  let pool = readPool();
+  const profile = pool.clash;
+  if (!profile?.port) return { pool, changed: false };
+  const url = normalizeProxyUrl(`${profile.scheme ?? "http"}://127.0.0.1:${profile.port}`);
+  if (!url) return { pool, changed: false };
+  let entry = pool.entries.find((e) => e.url === url);
+  if (!entry) {
+    pool = addProxy(url, `本机 Clash ${profile.port}`);
+    entry = pool.entries.find((e) => e.url === url);
+  }
+  if (!entry) return { pool, changed: false };
+  if (!entry.enabled) {
+    const id = entry.id;
+    pool = setProxyEnabled(id, true);
+    entry = pool.entries.find((e) => e.id === id) ?? entry;
+  }
+  if (pool.activeId === entry.id) return { pool, changed: false, url };
+  return { pool: writePool({ ...pool, activeId: entry.id }), changed: true, url };
+}
+
+/** 打分：可用、快、少失败优先；bad 直接排到最后 */
+function scoreOf(entry: ProxyEntry): number {
+  if (!entry.enabled) return -1e6;
+  let score = 0;
+  score += entry.health === "ok" ? 1000 : entry.health === "bad" ? -900 : 0;
+  score += Math.min(entry.speedKbps ?? 0, 5000) / 5;
+  score -= Math.min(entry.latencyMs ?? 6000, 6000) / 20;
+  score -= Math.min(entry.failCount ?? 0, 8) * 60;
+  return score;
+}
+
+/** 池里最值得用的那一条；excludeId 用来避开当前这条，真正换一个出口 */
+export function pickBestProxy(excludeId?: string): ProxyEntry | undefined {
+  const pool = readPool();
+  const usable = pool.entries.filter((e) => e.enabled).sort((a, b) => scoreOf(b) - scoreOf(a));
+  if (!usable.length) return undefined;
+  const other = usable.find((e) => e.id !== excludeId);
+  return other ?? usable[0];
+}
+
+/**
+ * 立刻换一条：定时轮换、被封禁、用户点「智能换一条」都走这里。
+ * 只改池里的 activeId，真正生效要等引擎用新出口重启。
+ */
+export function rotateNow(reason: "manual" | "interval" | "ban" | "fastest" = "manual"): ProxyPool {
+  const pool = readPool();
+  const enabled = pool.entries.filter((e) => e.enabled);
+  if (enabled.length < 1) return pool;
+  let next: ProxyEntry | undefined;
+  if (reason === "fastest") {
+    next = pickBestProxy();
+  } else if (reason === "interval") {
+    // 定时模式下按池顺序轮，保证每条都能被用到；只有一条时原地不动
+    const idx = enabled.findIndex((e) => e.id === pool.activeId);
+    next = enabled[(idx + 1) % enabled.length];
+  } else {
+    next = pickBestProxy(pool.activeId) ?? enabled[0];
+  }
+  if (!next) return pool;
+  return writePool({
+    ...pool,
+    activeId: next.id,
+    rotation: { ...normalizeRotation(pool.rotation), lastRotatedAt: Date.now() },
+  });
+}
+
+/** 把某条标记为「刚失败过」，智能选路下一轮会绕开它 */
+export function markProxyFailure(id: string, error?: string): ProxyPool {
+  const pool = readPool();
+  return writePool({
+    ...pool,
+    entries: pool.entries.map((e) =>
+      e.id === id
+        ? { ...e, health: "bad", failCount: (e.failCount ?? 0) + 1, checkedAt: Date.now(), error }
+        : e,
+    ),
+  });
+}
+
 export function clearPool(): ProxyPool {
-  return writePool({ ...DEFAULT_POOL });
+  return writePool({ ...DEFAULT_POOL, rotation: { ...DEFAULT_ROTATION } });
 }
 
 /** 代理池当前会给引擎用的那一条（没选就取第一条启用的，优先测活通过的） */
@@ -852,6 +1335,7 @@ export async function testProxies(ids?: string[], onTick?: (done: number, total:
         health: res.ok ? "ok" : "bad",
         latencyMs: res.ok ? res.ms : undefined,
         checkedAt: Date.now(),
+        failCount: res.ok ? 0 : (entry.failCount ?? 0) + 1,
         error: res.ok ? undefined : res.error ?? `HTTP ${res.status ?? "?"}`,
       });
       done += 1;
@@ -865,6 +1349,151 @@ export async function testProxies(ids?: string[], onTick?: (done: number, total:
     ...fresh,
     entries: fresh.entries.map((e) => results.get(e.id) ?? e),
   });
+}
+
+/* ----------------------------------------------------------------- 测速 --- */
+
+/** 测速用固定大小的下载：速度差异靠吞吐体现，不靠一次 204 的握手 */
+const SPEED_TARGETS = [
+  "https://speed.cloudflare.com/__down?bytes=400000",
+  "http://cachefly.cachefly.net/100kb.test",
+];
+const SPEED_TIMEOUT_MS = 15_000;
+const SPEED_CAP_BYTES = 2 * 1024 * 1024;
+
+/** 走指定代理下载一段数据，返回 KB/s */
+function measureSpeed(
+  ses: Electron.Session,
+  url: string,
+): Promise<{ ok: boolean; kbps: number; ms: number; bytes: number; status?: number; error?: string }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const started = Date.now();
+    const finish = (value: { ok: boolean; kbps: number; ms: number; bytes: number; status?: number; error?: string }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(
+      () => finish({ ok: false, kbps: 0, ms: Date.now() - started, bytes: 0, error: "测速超时" }),
+      SPEED_TIMEOUT_MS,
+    );
+    let bytes = 0;
+    try {
+      const req = net.request({ url, method: "GET", session: ses, useSessionCookies: false });
+      req.on("response", (res) => {
+        const status = res.statusCode;
+        if (status >= 400) {
+          finish({ ok: false, kbps: 0, ms: Date.now() - started, bytes: 0, status, error: `HTTP ${status}` });
+          res.on("data", () => undefined);
+          return;
+        }
+        res.on("data", (chunk) => {
+          bytes += chunk.length;
+          if (bytes >= SPEED_CAP_BYTES) {
+            const ms = Math.max(Date.now() - started, 1);
+            finish({ ok: true, kbps: Math.round((bytes / 1024 / ms) * 1000), ms, bytes, status });
+            req.abort();
+          }
+        });
+        res.on("end", () => {
+          const ms = Math.max(Date.now() - started, 1);
+          const ok = bytes > 20_000;
+          finish({
+            ok,
+            kbps: ok ? Math.round((bytes / 1024 / ms) * 1000) : 0,
+            ms,
+            bytes,
+            status,
+            error: ok ? undefined : `只下到 ${bytes} 字节`,
+          });
+        });
+        res.on("error", (err) => finish({ ok: false, kbps: 0, ms: Date.now() - started, bytes, status, error: err.message }));
+      });
+      req.on("error", (err) =>
+        finish({ ok: false, kbps: 0, ms: Date.now() - started, bytes, error: err.message }),
+      );
+      req.end();
+    } catch (err) {
+      finish({ ok: false, kbps: 0, ms: Date.now() - started, bytes, error: (err as Error).message });
+    }
+  });
+}
+
+async function speedViaSlot(slot: number, proxy: string) {
+  const ses = session.fromPartition(`tanwei-speed-${slot}`);
+  await ses.setProxy({ proxyRules: proxy, proxyBypassRules: "localhost,127.0.0.1,::1" }).catch(() => undefined);
+  let last = { ok: false, kbps: 0, ms: 0, bytes: 0, error: "无响应" } as Awaited<ReturnType<typeof measureSpeed>>;
+  for (const url of SPEED_TARGETS) {
+    last = await measureSpeed(ses, url);
+    if (last.ok) return last;
+    if (last.status && last.status >= 400) continue;
+    return last;
+  }
+  return last;
+}
+
+/**
+ * 逐条测速（不是测活）：走每个节点真下一段数据，拿 KB/s。
+ * 带账号密码的节点 Chromium 拨不了，交给 socket 探针测延迟，速度留空。
+ */
+export async function testSpeeds(
+  ids?: string[],
+  onTick?: (done: number, total: number) => void,
+): Promise<ProxySpeedResult> {
+  const pool = readPool();
+  const wanted = ids?.length ? new Set(ids) : undefined;
+  const targets = pool.entries.filter((e) => (wanted ? wanted.has(e.id) : e.enabled)).slice(-MAX_TEST);
+  if (!targets.length) return { pool, tested: 0, ok: 0, failed: 0 };
+
+  const results = new Map<string, ProxyEntry>();
+  let cursor = 0;
+  let done = 0;
+  let ok = 0;
+  const worker = async (slot: number) => {
+    for (;;) {
+      const idx = cursor;
+      cursor += 1;
+      const entry = targets[idx];
+      if (!entry) return;
+      if (WITH_CREDENTIALS.test(entry.url)) {
+        // 带认证的只能测延迟：Chromium 不吃 userinfo，socket 下载器不值得为测速再写一套
+        const res = await probeCredentialedProxy(entry.url);
+        results.set(entry.id, {
+          ...entry,
+          health: res.ok ? "ok" : "bad",
+          latencyMs: res.ok ? res.ms : undefined,
+          checkedAt: Date.now(),
+          failCount: res.ok ? 0 : (entry.failCount ?? 0) + 1,
+          error: res.ok ? "带账号密码，仅测延迟" : res.error ?? `HTTP ${res.status ?? "?"}`,
+        });
+        done += 1;
+        if (res.ok) ok += 1;
+        onTick?.(done, targets.length);
+        continue;
+      }
+      const res = await speedViaSlot(slot % HEALTH_SLOTS, entry.url);
+      if (res.ok) ok += 1;
+      results.set(entry.id, {
+        ...entry,
+        health: res.ok ? "ok" : entry.health === "ok" ? "ok" : "bad",
+        latencyMs: res.ms || entry.latencyMs,
+        speedKbps: res.ok ? res.kbps : undefined,
+        speedAt: Date.now(),
+        checkedAt: Date.now(),
+        failCount: res.ok ? 0 : (entry.failCount ?? 0) + 1,
+        error: res.ok ? undefined : res.error,
+      });
+      done += 1;
+      onTick?.(done, targets.length);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(HEALTH_SLOTS, targets.length) }, (_, i) => worker(i)));
+
+  const fresh = readPool();
+  const pool2 = writePool({ ...fresh, entries: fresh.entries.map((e) => results.get(e.id) ?? e) });
+  return { pool: pool2, tested: targets.length, ok, failed: targets.length - ok };
 }
 
 function fetchText(url: string, proxy: string): Promise<string> {

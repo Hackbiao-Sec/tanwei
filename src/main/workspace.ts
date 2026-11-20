@@ -149,7 +149,8 @@ const SKIP_DIRS = new Set(["node_modules", ".git", "__pycache__"]);
 
 /** 任务夹里的文件清单（两层深），给「文件预览」用 */
 export async function listTaskFiles(taskName?: string): Promise<TaskFile[]> {
-  const out: TaskFile[] = [];
+  // 先只走目录把路径收齐，再并发取 stat：桌面任务多时串行 stat 会拖到三四秒
+  const pending: { task: string; group: string; name: string; path: string }[] = [];
 
   const walk = async (task: string, dir: string, group: string, depth: number) => {
     let entries: fs.Dirent[] = [];
@@ -167,15 +168,7 @@ export async function listTaskFiles(taskName?: string): Promise<TaskFile[]> {
         continue;
       }
       if (!e.isFile()) continue;
-      const st = await fsp.stat(full).catch(() => undefined);
-      out.push({
-        task,
-        group,
-        name: e.name,
-        path: full,
-        size: st?.size ?? 0,
-        updatedAt: st?.mtimeMs ?? 0,
-      });
+      pending.push({ task, group, name: e.name, path: full });
     }
   };
 
@@ -193,6 +186,18 @@ export async function listTaskFiles(taskName?: string): Promise<TaskFile[]> {
       else if (e.isFile()) await walk(task, root, "根目录", 2);
     }
   }
+
+  const out: TaskFile[] = new Array(pending.length);
+  let cursor = 0;
+  const statWorker = async () => {
+    while (cursor < pending.length) {
+      const i = cursor++;
+      const item = pending[i];
+      const st = await fsp.stat(item.path).catch(() => undefined);
+      out[i] = { ...item, size: st?.size ?? 0, updatedAt: st?.mtimeMs ?? 0 };
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(8, pending.length) }, statWorker));
 
   // 每个任务夹的每个子目录最多留 300 个最新文件，避免 js/ 之类大目录把 IPC 撑爆
   const perGroup = new Map<string, TaskFile[]>();

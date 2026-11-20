@@ -10,7 +10,6 @@ import type {
   ProxyMode,
   ProxyPool,
   McpServerInfo,
-  ReportEntry,
   RuleEntry,
   SessionState,
   SessionSummary,
@@ -25,24 +24,17 @@ import { ProxyPool as ProxyPoolPanel } from "./ProxyPool";
 import { Dashboard } from "./Dashboard";
 import { Findings } from "./Findings";
 import { Graph } from "./Graph";
+import { Reports } from "./Reports";
 import { Tasks } from "./Tasks";
 import { Assets } from "./Assets";
+import { Files } from "./Files";
+import { NotifyPanel } from "./NotifyPanel";
+import { MiniProgramPanel } from "./MiniProgramPanel";
+import { AppPentestPanel } from "./AppPentestPanel";
+import { MobileToolkit } from "./MobileToolkit";
 import { Traffic } from "./Traffic";
 import { Tools } from "./Tools";
 import { Logs } from "./Logs";
-
-function fmtTime(t?: number): string {
-  if (!t) return "—";
-  const d = new Date(t);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-function fmtSize(n: number): string {
-  if (n > 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  if (n > 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${n} B`;
-}
 
 function Crumbs({ items }: { items: string[] }) {
   return (
@@ -56,7 +48,7 @@ function Crumbs({ items }: { items: string[] }) {
   );
 }
 
-const SELF_HEADED: ModuleId[] = ["dashboard"];
+const SELF_HEADED: ModuleId[] = ["dashboard", "traffic", "app"];
 
 const PROXY_MODES: { id: ProxyMode; label: string; hint: string }[] = [
   { id: "system", label: "跟随系统", hint: "读 Windows 代理设置" },
@@ -85,9 +77,9 @@ export function ModulePage({
   onOpenSession,
   onCreateSession,
   onAsk,
+  onStage,
   onModule,
   commands,
-  sessionTasks = [],
   activeId,
 }: {
   id: ModuleId;
@@ -102,15 +94,14 @@ export function ModulePage({
   onOpenSession: (id: string) => void;
   onCreateSession: () => void;
   onAsk: (prompt: string) => void;
+  /** 把写好的渗透需求放进当前会话输入框，等用户自己点发送 */
+  onStage: (prompt: string) => void;
   onModule: (id: ModuleId) => void;
   commands: CommandInfo[];
-  /** 当前会话碰过的任务夹，用来做「本会话 / 全部」隔离 */
-  sessionTasks?: string[];
   /** 当前打开的会话，渗透过程图谱默认看它 */
   activeId?: string;
 }) {
   const def = MODULES.find((m) => m.id === id)!;
-  const [reports, setReports] = useState<ReportEntry[]>([]);
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [rules, setRules] = useState<RuleEntry[]>([]);
   const [mcpList, setMcpList] = useState<McpServerInfo[]>([]);
@@ -118,6 +109,7 @@ export function ModulePage({
   const [error, setError] = useState<string>();
   const [startup, setStartup] = useState<{ path: string; text: string; safeMode: boolean }>();
   const [busySkill, setBusySkill] = useState<string>();
+  const [busyRule, setBusyRule] = useState<string>();
   const [installOpen, setInstallOpen] = useState(false);
   const [installBusy, setInstallBusy] = useState(false);
   const [notice, setNotice] = useState<string>();
@@ -276,11 +268,23 @@ export function ModulePage({
     }
   };
 
+  const toggleRule = async (rule: RuleEntry) => {
+    setBusyRule(rule.path);
+    setError(undefined);
+    try {
+      const next = await window.tanwei.setRuleDisabled(rule.path, !rule.disabled);
+      setRules(next);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyRule(undefined);
+    }
+  };
+
   const load = async (which: ModuleId) => {
     setLoading(true);
     setError(undefined);
     try {
-      if (which === "reports") setReports(await window.tanwei.reports());
       if (which === "skills") setSkills(await window.tanwei.skills());
       if (which === "rules") setRules(await window.tanwei.rules());
       if (which === "mcp") setMcpList(await window.tanwei.mcp());
@@ -292,7 +296,7 @@ export function ModulePage({
   };
 
   useEffect(() => {
-    if (["reports", "skills", "rules", "mcp"].includes(id)) void load(id);
+    if (["skills", "rules", "mcp"].includes(id)) void load(id);
     if (id === "settings") {
       void window.tanwei.startupLog().then(setStartup).catch(() => undefined);
       void window.tanwei.network().then(setNet).catch(() => undefined);
@@ -322,7 +326,15 @@ export function ModulePage({
 
   const poolOk = (pool?.entries ?? []).filter((e) => e.health === "ok").length;
   return (
-    <div className="module-page">
+    <div
+      className={
+        id === "traffic"
+          ? "module-page module-page-flush"
+          : id === "app"
+            ? "module-page module-page-wide"
+            : "module-page"
+      }
+    >
       {!SELF_HEADED.includes(id) ? (
         <div className="module-head">
           <div>
@@ -340,7 +352,7 @@ export function ModulePage({
                 <span>{installOpen ? "收起安装" : "安装技能"}</span>
               </button>
             ) : null}
-            {["reports", "skills", "rules", "mcp"].includes(id) ? (
+            {["skills", "rules", "mcp"].includes(id) ? (
               <button className="btn ghost" onClick={() => void load(id)}>
                 <Icon name="refresh" size={13} />
                 <span>{loading ? "读取中…" : "刷新"}</span>
@@ -355,7 +367,7 @@ export function ModulePage({
       {id === "models" ? <ModelsPanel boot={boot} /> : null}
       {id === "proxy" ? <ProxyPoolPanel /> : null}
       {body()}
-      {id === "findings" ? <Findings onAsk={onAsk} sessionTasks={sessionTasks} activeId={activeId} /> : null}
+      {id === "findings" ? <Findings onAsk={onAsk} /> : null}
       {id === "tasks" ? (
         <Tasks
           live={live}
@@ -365,34 +377,17 @@ export function ModulePage({
           onCreateSession={onCreateSession}
         />
       ) : null}
-      {id === "assets" ? <Assets onAsk={onAsk} sessionTasks={sessionTasks} activeId={activeId} /> : null}
+      {id === "assets" ? <Assets onAsk={onAsk} /> : null}
+      {id === "files" ? <Files /> : null}
+      {id === "notify" ? <NotifyPanel /> : null}
       {id === "traffic" ? <Traffic activeId={activeId} live={live} /> : null}
+      {id === "mini" ? <MiniProgramPanel onAsk={onAsk} onStage={onStage} /> : null}
+      {id === "app" ? <AppPentestPanel onAsk={onAsk} onStage={onStage} /> : null}
       {id === "graph" ? <Graph onAsk={onAsk} live={live} activeId={activeId} /> : null}
       {id === "tools" ? <Tools commands={commands} mcp={mcp} /> : null}
       {id === "logs" ? <Logs /> : null}
 
-      {id === "reports" ? (
-        <div className="table">
-          <div className="table-head">
-            <span>报告标题</span>
-            <span>任务</span>
-            <span>大小</span>
-            <span>更新时间</span>
-          </div>
-          {reports.length === 0 ? (
-            <div className="module-empty">还没有正式报告。</div>
-          ) : (
-            reports.map((r) => (
-              <button className="table-row" key={r.path} onClick={() => void window.tanwei.openPath(r.path)}>
-                <span className="table-title">{r.title}</span>
-                <span className="chip chip-ghost">{r.task}</span>
-                <span className="mono subtle">{fmtSize(r.size)}</span>
-                <span className="mono subtle">{fmtTime(r.updatedAt)}</span>
-              </button>
-            ))
-          )}
-        </div>
-      ) : null}
+      {id === "reports" ? <Reports /> : null}
 
       {id === "skills" ? (
         <div className="skill-wrap">
@@ -499,25 +494,49 @@ export function ModulePage({
       ) : null}
 
       {id === "rules" ? (
-        <div className="table">
-          <div className="table-head">
-            <span>规则</span>
-            <span>文件</span>
-            <span>规模</span>
-            <span>操作</span>
+        <div className="skill-wrap">
+          <div className="table skill-table">
+            <div className="table-head">
+              <span>规则</span>
+              <span>文件</span>
+              <span>规模</span>
+              <span>状态</span>
+            </div>
+            {rules.length === 0 ? (
+              <div className="module-empty">`~/.grok/rules` 下没有规则文件。</div>
+            ) : (
+              rules.map((r) => (
+                <div className={`table-row skill-row${r.disabled ? " is-off" : ""}`} key={r.path}>
+                  <span className="table-title">{r.title || r.name}</span>
+                  <span className="mono subtle">{r.disabled ? `${r.name}.md.disabled` : `${r.name}.md`}</span>
+                  <span className="mono subtle">{r.tokens ? `${r.tokens} 字` : "—"}</span>
+                  <span className="skill-status">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={!r.disabled}
+                      aria-label={`${r.disabled ? "启用" : "关闭"}规则 ${r.name}`}
+                      className={`switch${r.disabled ? "" : " on"}`}
+                      disabled={busyRule === r.path}
+                      onClick={() => void toggleRule(r)}
+                    />
+                    <span className="skill-state">{r.disabled ? "已关闭" : "已启用"}</span>
+                    <button
+                      type="button"
+                      className="skill-open"
+                      onClick={() => void window.tanwei.openPath(r.path)}
+                    >
+                      打开
+                    </button>
+                  </span>
+                </div>
+              ))
+            )}
           </div>
-          {rules.length === 0 ? (
-            <div className="module-empty">`~/.grok/rules` 下没有规则文件。</div>
-          ) : (
-            rules.map((r) => (
-              <button className="table-row" key={r.path} onClick={() => void window.tanwei.openPath(r.path)}>
-                <span className="table-title">{r.title || r.name}</span>
-                <span className="mono subtle">{r.name}</span>
-                <span className="mono subtle">{r.tokens ? `${r.tokens} 字` : "—"}</span>
-                <span className="chip chip-ghost">打开</span>
-              </button>
-            ))
-          )}
+          <p className="skill-hint">
+            引擎会加载 ~/.grok/rules 下每个 .md 文件，所以关闭就是把后缀改成 .md.disabled：文件留在原地，随时能开回来。
+            关闭后这条规则不再注入新会话的系统提示；已在跑的会话如需立刻生效请重启引擎。
+          </p>
         </div>
       ) : null}
 
@@ -567,6 +586,8 @@ export function ModulePage({
               </button>
             </div>
           </div>
+
+          <MobileToolkit />
 
           <div className="card">
             <div className="card-top">
@@ -738,7 +759,7 @@ export function ModulePage({
             <div className="kv"><span className="kv-k">工作目录</span><span className="kv-v mono">{boot?.cwd ?? "—"}</span></div>
             <div className="kv"><span className="kv-k">用户目录</span><span className="kv-v mono">{boot?.home ?? "—"}</span></div>
             <div className="card-note">
-              该控制台通过 ACP（agent client protocol）驱动 `grok agent --no-leader stdio`，与原生 TUI 共用同一套配置、会话、技能与 MCP。
+              控制台与命令行终端共用同一套配置、会话、技能、规则与 MCP：这边改完，终端那边就是同一份。
             </div>
           </div>
         </div>

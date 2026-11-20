@@ -27,8 +27,9 @@ export function resolveGrokPath(): string {
   ].filter(Boolean) as string[];
 
   for (const c of candidates) {
+    // 只认真实文件：候选路径可能是个目录（比如只解压了目录），拿去 spawn 只会 EINVAL
     try {
-      if (fs.existsSync(c)) return c;
+      if (fs.existsSync(c) && fs.statSync(c).isFile()) return c;
     } catch {
       /* keep looking */
     }
@@ -289,6 +290,8 @@ function readDisabledSkills(): string[] {
   }
 }
 
+const RULE_OFF_SUFFIX = ".disabled";
+
 export async function listRules(): Promise<RuleEntry[]> {
   const dir = path.join(grokHome(), "rules");
   let entries: fs.Dirent[] = [];
@@ -299,7 +302,10 @@ export async function listRules(): Promise<RuleEntry[]> {
   }
   const out: RuleEntry[] = [];
   for (const e of entries) {
-    if (!e.isFile() || !e.name.toLowerCase().endsWith(".md")) continue;
+    if (!e.isFile()) continue;
+    const lower = e.name.toLowerCase();
+    const disabled = lower.endsWith(`.md${RULE_OFF_SUFFIX}`);
+    if (!lower.endsWith(".md") && !disabled) continue;
     const file = path.join(dir, e.name);
     let text = "";
     try {
@@ -307,15 +313,36 @@ export async function listRules(): Promise<RuleEntry[]> {
     } catch {
       continue;
     }
-    const title = /^#\s+(.+)$/m.exec(text)?.[1]?.trim() || e.name.replace(/\.md$/i, "");
+    const base = disabled ? e.name.slice(0, -RULE_OFF_SUFFIX.length) : e.name;
+    const title = /^#\s+(.+)$/m.exec(text)?.[1]?.trim() || base.replace(/\.md$/i, "");
     out.push({
-      name: e.name.replace(/\.md$/i, ""),
+      name: base.replace(/\.md$/i, ""),
       title,
       path: file,
       tokens: Math.ceil(text.length / 3.2),
+      disabled,
     });
   }
-  return out.sort((a, b) => a.name.localeCompare(b.name));
+  return out.sort((a, b) =>
+    a.disabled === b.disabled ? a.name.localeCompare(b.name) : a.disabled ? 1 : -1,
+  );
+}
+
+/**
+ * 开关一条规则：引擎只扫 rules/*.md，关掉就把后缀改成 .md.disabled（文件留在原地，
+ * 随时能开回来），打开再改回去。改完对新建会话生效，已在跑的会话要重启引擎。
+ */
+export async function setRuleDisabled(file: string, disabled: boolean): Promise<RuleEntry[]> {
+  const dir = path.resolve(path.join(grokHome(), "rules"));
+  const abs = path.resolve(file);
+  if (path.dirname(abs) !== dir) throw new Error("只能切换 ~/.grok/rules 下的规则文件");
+  const isOff = abs.toLowerCase().endsWith(`.md${RULE_OFF_SUFFIX}`);
+  if (disabled && isOff) return listRules();
+  if (!disabled && !isOff) return listRules();
+  const target = disabled ? `${abs}${RULE_OFF_SUFFIX}` : abs.slice(0, -RULE_OFF_SUFFIX.length);
+  if (fs.existsSync(target)) throw new Error(`目标文件已存在：${path.basename(target)}`);
+  await fsp.rename(abs, target);
+  return listRules();
 }
 
 export function taskRoots(): { task: string; root: string }[] {

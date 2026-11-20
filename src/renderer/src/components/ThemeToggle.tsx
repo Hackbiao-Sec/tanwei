@@ -4,7 +4,7 @@ import { Icon } from "./Icons";
 type Theme = "dark" | "light";
 
 function readTheme(): Theme {
-  return localStorage.getItem("tanwei.theme") === "light" ? "light" : "dark";
+  return localStorage.getItem("tanwei.theme") === "dark" ? "dark" : "light";
 }
 
 /**

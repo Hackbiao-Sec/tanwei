@@ -1,5 +1,6 @@
 import React from "react";
 import type { EngineStatus, McpServerInfo, SessionState, TimelineItem, ToolCallView } from "@shared/types";
+import { usedTokens } from "@shared/usage";
 import { Icon } from "./Icons";
 
 function tokens(n?: number): string {
@@ -60,10 +61,8 @@ export function RightRail({
   const usage = state?.usage;
   const ctx = state?.contextWindow ?? 0;
   // 占窗口的是「这一轮发出去的那整段提示」：输入 + 缓存读 + 缓存写。
-  // 输出属于本轮产物，紧接着也会进历史，所以能用 prompt 侧就以 prompt 侧为准。
-  const promptTokens =
-    (usage?.inputTokens ?? 0) + (usage?.cacheReadTokens ?? 0) + (usage?.cacheWriteTokens ?? 0);
-  const used = promptTokens > 0 ? promptTokens : usage?.totalTokens ?? 0;
+  // 引擎只在回合结束才回整包用量，光看 prompt 侧会一直不动；总用量含流式估算，取大者让计数跟着走。
+  const used = usedTokens(usage);
   const ratio = ctx > 0 ? Math.min(1, used / ctx) : 0;
   const pct = ctx > 0 ? Math.round(ratio * 100) : 0;
   const compactAt = state?.compactAt ?? 85;
@@ -106,10 +105,16 @@ export function RightRail({
               ? `已到 ${compactAt}% 压缩线，下一轮引擎会先压缩历史再继续。`
               : `到 ${compactAt}% 引擎自动压缩：把早期内容收成摘要，最近对话和规则保留。`}
         </div>
+        {state?.usageEstimated ? (
+          <div className="ctx-est">输出按字符实时估算，回合结束用引擎回包校准</div>
+        ) : null}
         <div className="metric-grid">
           <div className="metric">
             <span className="metric-k">已用</span>
-            <span className="metric-v">{tokens(used)}</span>
+            <span className="metric-v">
+              {tokens(used)}
+              {state?.usageEstimated ? <span className="metric-est">估</span> : null}
+            </span>
           </div>
           <div className="metric">
             <span className="metric-k">窗口</span>

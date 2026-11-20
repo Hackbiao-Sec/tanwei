@@ -1,10 +1,29 @@
-import React, { useCallback, useEffect, useState } from "react";
-import type { McpServerConfig, McpServerInfo, McpServersConfig } from "@shared/types";
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import type {
+  McpProbeInput,
+  McpProbeResult,
+  McpServerConfig,
+  McpServerInfo,
+  McpServersConfig,
+} from "@shared/types";
 import { Icon } from "./Icons";
 
 function errText(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
   return raw.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/, "");
+}
+
+/** 表单里的环境变量文本 → 对象；格式不对当场抛，避免带着半截配置去握手 */
+function parseEnv(text: string): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) throw new Error(`环境变量要写成 KEY=VALUE：${line}`);
+    env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+  }
+  return env;
 }
 
 interface FormState {
@@ -51,7 +70,7 @@ const PRESETS: { id: string; label: string; hint: string; patch: Partial<FormSta
     patch: {
       name: "playwright",
       command: "node",
-      args: "C:\\Users\\Hackbiao\\.grok\\bin\\playwright-dual-slot.mjs",
+      args: "C:\\Users\\<你的用户名>\\.grok\\bin\\playwright-dual-slot.mjs",
       extra: "startup_timeout_sec = 300\ntool_timeout_sec = 180",
     },
   },
@@ -87,6 +106,9 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | undefined>();
   const [pendingDelete, setPendingDelete] = useState<string | null>(null);
+  /** key = 服务名，表单里没保存的用 __form */
+  const [probes, setProbes] = useState<Record<string, McpProbeResult | "running">>({});
+  const probeRefs = useRef<Record<string, HTMLDivElement | null>>({});
 
   const reload = useCallback(async () => {
     try {
@@ -103,20 +125,139 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
   const statusOf = (name: string): McpServerInfo | undefined =>
     runtime.find((r) => r.name === name);
 
+  /** 刚出结果的是哪一块；用 state 而不是直接滚，等渲染提交后再量位置 */
+  const [reveal, setReveal] = useState<{ key: string; tick: number }>({ key: "", tick: 0 });
+  const revealTick = useRef(0);
+
+  /** 结果出来时滚到眼前：表单很长，不然红字藏在按钮下面看不见 */
+  const revealProbe = (key: string): void => {
+    revealTick.current += 1;
+    setReveal({ key, tick: revealTick.current });
+  };
+
+  useEffect(() => {
+    if (!reveal.key) return;
+    let tries = 0;
+    const step = (): void => {
+      const el = probeRefs.current[reveal.key];
+      if (!el) {
+        // 结果刚 setState，节点可能还没挂上，等两帧再试
+        if (tries++ < 5) requestAnimationFrame(step);
+        return;
+      }
+      const host = el.closest("main.stage") ?? document.documentElement;
+      const view = host.getBoundingClientRect();
+      const box = el.getBoundingClientRect();
+      if (box.top >= view.top && box.bottom <= view.bottom) return;
+      el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    };
+    requestAnimationFrame(step);
+  }, [reveal]);
+
+  /** 真拉起服务端做一次握手，不重启引擎 */
+  const probe = useCallback(async (input: McpProbeInput, key: string) => {
+    setProbes((prev) => ({ ...prev, [key]: "running" }));
+    try {
+      const result = await window.tanwei.probeMcpServer(input);
+      setProbes((prev) => ({ ...prev, [key]: result }));
+    } catch (err) {
+      setProbes((prev) => ({ ...prev, [key]: { ok: false, latencyMs: 0, error: errText(err) } }));
+    }
+    revealProbe(key);
+  }, []);
+
+  const probeSaved = (s: McpServerConfig): void => {
+    void probe(
+      {
+        name: s.name,
+        command: s.command,
+        args: s.args,
+        cwd: s.cwd,
+        env: s.env,
+        extra: s.extra,
+      },
+      s.name,
+    );
+  };
+
+  const probeForm = (): void => {
+    if (!form) return;
+    setNotice(undefined);
+    if (!form.command.trim()) {
+      setNotice("启动命令为空：先填 command 再测试");
+      return;
+    }
+    let env: Record<string, string>;
+    try {
+      env = parseEnv(form.env);
+    } catch (err) {
+      setNotice(errText(err));
+      return;
+    }
+    void probe(
+      {
+        name: form.name.trim() || undefined,
+        command: form.command.trim(),
+        args: form.args.split(/\r?\n/).map((a) => a.trim()).filter(Boolean),
+        cwd: form.cwd.trim() || undefined,
+        env,
+        extra: form.extra,
+      },
+      "__form",
+    );
+  };
+
+  const probeNode = (key: string): React.JSX.Element | null => {
+    const r = probes[key];
+    if (!r) return null;
+    if (r === "running") {
+      return (
+        <div className="card-probe running" ref={(el) => (probeRefs.current[key] = el)}>
+          <span className="probe-dot" />
+          <span>握手中…</span>
+        </div>
+      );
+    }
+    if (r.ok) {
+      const tags = [
+        `${r.latencyMs} ms`,
+        `${r.toolCount ?? 0} 个工具`,
+        r.serverName ? `${r.serverName}${r.serverVersion ? ` v${r.serverVersion}` : ""}` : "",
+        r.protocolVersion ? `协议 ${r.protocolVersion}` : "",
+      ].filter(Boolean);
+      return (
+        <div className="card-probe probe-ok" ref={(el) => (probeRefs.current[key] = el)}>
+          <span className="probe-dot" />
+          <div className="probe-body">
+            <span className="probe-text">连接正常 · {tags.join(" · ")}</span>
+            {r.toolNames?.length ? (
+              <span className="probe-tools mono" title={r.toolNames.join(", ")}>
+                {r.toolNames.join(", ")}
+              </span>
+            ) : null}
+          </div>
+        </div>
+      );
+    }
+    const tail = r.stderr?.trim().split(/\r?\n/).slice(-4).join("\n");
+    return (
+      <div className="card-probe probe-fail" ref={(el) => (probeRefs.current[key] = el)}>
+        <span className="probe-dot" />
+        <div className="probe-body">
+          <span className="probe-text">连接失败 · {r.error ?? "未知原因"}</span>
+          {tail ? <span className="probe-stderr mono">{tail}</span> : null}
+        </div>
+      </div>
+    );
+  };
+
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!form) return;
     setBusy(true);
     setNotice(undefined);
     try {
-      const env: Record<string, string> = {};
-      for (const raw of form.env.split(/\r?\n/)) {
-        const line = raw.trim();
-        if (!line || line.startsWith("#")) continue;
-        const eq = line.indexOf("=");
-        if (eq <= 0) throw new Error(`环境变量要写成 KEY=VALUE：${line}`);
-        env[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
-      }
+      const env = parseEnv(form.env);
       const next = await window.tanwei.saveMcpServer({
         name: form.name.trim(),
         originalName: form.originalName,
@@ -150,6 +291,33 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
     } finally {
       setBusy(false);
       setPendingDelete(null);
+    }
+  };
+
+  const toggleServer = async (s: McpServerConfig) => {
+    setBusy(true);
+    setNotice(undefined);
+    try {
+      const next = await window.tanwei.saveMcpServer({
+        name: s.name,
+        originalName: s.name,
+        command: s.command,
+        args: s.args,
+        cwd: s.cwd,
+        enabled: s.enabled === false,
+        env: s.env,
+        extra: s.extra,
+      });
+      setConfig(next);
+      onToast?.(
+        "ok",
+        `${s.name} 已${s.enabled === false ? "启用" : "关闭"}，重启引擎后生效`,
+      );
+      onChanged?.();
+    } catch (err) {
+      setNotice(errText(err));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -292,11 +460,16 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
 
           <div className="model-form-foot">
             <div className="model-form-actions">
+              <button className="btn ghost" type="button" onClick={probeForm} disabled={busy}>
+                <Icon name="plug" size={13} />
+                <span>{probes.__form === "running" ? "测试中…" : "测试连接"}</span>
+              </button>
               <button className="btn primary" type="submit" disabled={busy}>
                 {busy ? "保存中…" : "保存"}
               </button>
             </div>
           </div>
+          <div className="model-form-foot">{probeNode("__form")}</div>
         </form>
       ) : null}
 
@@ -315,7 +488,18 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
               <div className="card model-card" key={s.name}>
                 <div className="card-top">
                   <span className="card-title mono">{s.name}</span>
-                  <span className={`chip ${chipClass}`}>{status}</span>
+                  <span className="skill-status">
+                    <span className={`chip ${chipClass}`}>{status}</span>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={s.enabled !== false}
+                      aria-label={`${s.enabled === false ? "启用" : "关闭"} MCP 服务 ${s.name}`}
+                      className={`switch${s.enabled === false ? "" : " on"}`}
+                      disabled={busy}
+                      onClick={() => void toggleServer(s)}
+                    />
+                  </span>
                 </div>
                 <div className="kv">
                   <span className="kv-k">命令</span>
@@ -347,7 +531,16 @@ export function McpPanel({ runtime, onChanged, onRestartEngine, onToast }: Props
                 ) : null}
                 {rt?.status === "failed" && rt.reason ? <div className="card-note">{rt.reason}</div> : null}
                 {s.extra ? <div className="card-note mono">{s.extra.split("\n")[0]}</div> : null}
+                {probeNode(s.name)}
                 <div className="card-actions">
+                  <button
+                    className="btn ghost sm"
+                    onClick={() => probeSaved(s)}
+                    disabled={busy || probes[s.name] === "running"}
+                  >
+                    <Icon name="plug" size={12} />
+                    <span>{probes[s.name] === "running" ? "测试中…" : "测试连接"}</span>
+                  </button>
                   <button
                     className="btn ghost sm"
                     onClick={() => {

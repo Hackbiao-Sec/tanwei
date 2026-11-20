@@ -13,13 +13,37 @@ import type {
 import { Sidebar } from "./components/Sidebar";
 import { Timeline } from "./components/Timeline";
 import { Composer } from "./components/Composer";
+import type { ComposerDraft } from "./components/Composer";
 import { RightRail } from "./components/RightRail";
 import { ModulePage } from "./components/Modules";
-import { sessionTasks } from "./lib/scope";
+import { SessionScopeProvider } from "./lib/sessionScope";
 import { ThemeToggle } from "./components/ThemeToggle";import { Icon } from "./components/Icons";
+import { usedTokens } from "@shared/usage";
 import type { ModuleId, View } from "./view";
 
-type Toast = { id: number; level: "info" | "warn" | "error"; text: string };
+type Toast = {
+  id: number;
+  level: "info" | "warn" | "error" | "done";
+  text: string;
+  title?: string;
+  detail?: string[];
+  sessionId?: string;
+};
+
+function fmtTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(Math.round(n));
+}
+
+function fmtDuration(ms: number): string {
+  const s = Math.max(1, Math.round(ms / 1000));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  const rest = s % 60;
+  return rest ? `${m} 分 ${rest} 秒` : `${m} 分钟`;
+}
 
 /** ACP 只上报它自己见过的服务；CLI 读到的是配置全量。两边合并，ACP 的就绪状态优先。 */
 function mergeMcp(prev: McpServerInfo[], next: McpServerInfo[]): McpServerInfo[] {
@@ -55,13 +79,14 @@ export function App() {
   /** config.toml 里自己配的模型 key；下拉只列这些，避免误选中转目录里的裸模型 */
   const [configModelKeys, setConfigModelKeys] = useState<Set<string>>(new Set());
   const [configDefaultKey, setConfigDefaultKey] = useState<string>();
-  /** 桌面里真实存在的任务夹，用来过滤会话里提到的任务名 */
-  const [knownTasks, setKnownTasks] = useState<Set<string>>(new Set());
   const [commands, setCommands] = useState<CommandInfo[]>([]);
   const [mcp, setMcp] = useState<McpServerInfo[]>([]);
   const [history, setHistory] = useState<SessionSummary[]>([]);
   const [boot, setBoot] = useState<BootstrapInfo | null>(null);
   const [draftCwd, setDraftCwd] = useState("");
+  // 面板「发到当前会话对话框」塞进来的草稿；seq 递增才覆盖输入框
+  const [composerDraft, setComposerDraft] = useState<ComposerDraft>();
+  const draftSeq = useRef(0);
   const [loadingId, setLoadingId] = useState<string>();
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [creating, setCreating] = useState(false);
@@ -96,10 +121,17 @@ export function App() {
   }, []);
 
   const toast = useCallback(
-    (level: Toast["level"], text: string) => {
+    (
+      level: Toast["level"],
+      text: string,
+      extra?: { title?: string; detail?: string[]; sessionId?: string; ttl?: number },
+    ) => {
       const id = toastSeq.current++;
-      setToasts((prev) => [...prev.slice(-3), { id, level, text }]);
-      setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000);
+      setToasts((prev) => [...prev.slice(-3), { id, level, text, ...extra }]);
+      setTimeout(
+        () => setToasts((prev) => prev.filter((t) => t.id !== id)),
+        extra?.ttl ?? 6000,
+      );
     },
     [],
   );
@@ -159,6 +191,20 @@ export function App() {
         case "notice":
           toast(ev.level, ev.text);
           break;
+        case "turn-done": {
+          const r = ev.report;
+          const head = r.failedTools > 0 ? `工具 ${r.toolCount} 次 · 失败 ${r.failedTools}` : `工具 ${r.toolCount} 次`;
+          toast("done", r.excerpt || "本轮已结束，可以查看完整过程", {
+            title: `任务完成 · ${r.title}`,
+            detail: [
+              `耗时 ${fmtDuration(r.durationMs)} · ${head}`,
+              `上下文已用 ${fmtTokens(usedTokens(r.usage))} tokens · 输出 ${fmtTokens(r.usage.outputTokens)}`,
+            ],
+            sessionId: r.sessionId,
+            ttl: 16000,
+          });
+          break;
+        }
         case "reset":
           // 引擎重启后旧会话句柄全部失效，清空本地缓存等新的 session 事件
           store.current.clear();
@@ -175,6 +221,19 @@ export function App() {
     });
     return off;
   }, [bump, select, toast]);
+
+  // 风控事件全应用可见：盯着测试过程的时候也要当场知道被拦了，不用切到告警面板
+  useEffect(
+    () =>
+      window.tanwei.onRiskEvent((sig) => {
+        const evidence = sig.evidence.length > 90 ? `${sig.evidence.slice(0, 90)}…` : sig.evidence;
+        toast("warn", `${sig.target ? `${sig.target} · ` : ""}${evidence}`, {
+          title: `被目标风控 · ${sig.category}`,
+          ttl: 14000,
+        });
+      }),
+    [toast],
+  );
 
   // ------------------------------------------------------------------- boot
   useEffect(() => {
@@ -211,8 +270,6 @@ export function App() {
           setConfigModelKeys(new Set(cfgModels.models.map((m) => m.key)));
           if (cfgModels.defaultKey) setConfigDefaultKey(cfgModels.defaultKey);
         }
-        const taskNames = await window.tanwei.tasks().catch(() => [] as string[]);
-        if (!cancelled) setKnownTasks(new Set(taskNames));
         await window.tanwei.refreshSessions();
         if (cancelled) return;
 
@@ -306,9 +363,15 @@ export function App() {
     }
   };
 
-  const send = (text: string) => {
+  const send = (text: string, attachments?: string[]) => {
     if (!activeId) return;
-    void window.tanwei.prompt(activeId, text).catch((err) => {
+    const files = attachments ?? [];
+    // 附件先按会话登记：APP / 小程序面板靠这份登记显示「已上传、待分析」
+    if (files.length) void window.tanwei.uploadAdd(files, activeId).catch(() => undefined);
+    const body = files.length
+      ? `${files.map((p) => `[附件] ${p}`).join("\n")}\n\n${text}`
+      : text;
+    void window.tanwei.prompt(activeId, body).catch((err) => {
       toast("error", `发送失败：${err instanceof Error ? err.message : String(err)}`);
     });
   };
@@ -316,6 +379,36 @@ export function App() {
   const cancel = () => {
     if (!activeId) return;
     void window.tanwei.cancel(activeId);
+  };
+
+  // 删会话：主进程停回合 + 删磁盘目录；删的是当前会话就退到别的会话或新建
+  const deleteSession = async (id: string) => {
+    const wasActive = activeRef.current === id;
+    const snapshot = store.current.get(id);
+    const rest = [...store.current.keys()]
+      .filter((key) => key !== id)
+      .concat(history.map((h) => h.id).filter((hid) => hid !== id));
+
+    // 删目录和重读会话列表都要等，先把行摘掉、切走，不然点了像没反应
+    store.current.delete(id);
+    setHistory((prev) => prev.filter((h) => h.id !== id));
+    bump();
+
+    if (wasActive) {
+      select(undefined);
+      if (rest[0]) await openSession(rest[0]);
+      else await createSession();
+    }
+
+    try {
+      await window.tanwei.deleteSession(id);
+      toast("info", "会话已删除");
+    } catch (err) {
+      if (snapshot) store.current.set(id, snapshot);
+      bump();
+      void window.tanwei.refreshSessions().catch(() => undefined);
+      toast("error", `删除会话失败：${err instanceof Error ? err.message : String(err)}`);
+    }
   };
 
   const changeMode = (mode: PermissionMode) => {
@@ -338,31 +431,8 @@ export function App() {
     [models, configModelKeys],
   );
 
-  // 当前会话碰过哪些任务夹：给「发现 / 图谱 / 资产」做本会话隔离
+  // 本会话的产物归属由主进程会话快照统一给出，渲染层不再自己从时间线文本里猜任务夹
   const activeState = findState(activeId);
-  const [diskTasks, setDiskTasks] = useState<string[]>([]);
-  useEffect(() => {
-    if (!activeId) {
-      setDiskTasks([]);
-      return;
-    }
-    let cancelled = false;
-    void window.tanwei
-      .sessionTasks(activeId)
-      .then((names) => {
-        if (!cancelled) setDiskTasks(names);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
-  }, [activeId, activeState?.updatedAt]);
-
-  const activeSessionTasks = useMemo(() => {
-    if (diskTasks.length) return diskTasks;
-    const found = sessionTasks(activeState);
-    return knownTasks.size ? found.filter((t) => knownTasks.has(t)) : found;
-  }, [diskTasks, activeId, activeState?.updatedAt, activeState?.timeline.length, knownTasks]);
 
   const respond = (requestId: number, optionId: string) => {
     void window.tanwei.respondPermission(requestId, optionId);
@@ -385,6 +455,32 @@ export function App() {
       setDraftCwd(dir);
       toast("info", `新会话将使用目录：${dir}`);
     }
+  };
+
+  /** 从面板把已经写好的渗透需求放进输入框，发不发由用户自己点 */
+  const stagePrompt = (text: string) => {
+    const put = () => {
+      draftSeq.current += 1;
+      setComposerDraft({ text, seq: draftSeq.current });
+      setView({ kind: "session" });
+    };
+    if (activeId) {
+      put();
+      toast("info", "需求已写进当前会话输入框，确认后点发送");
+      return;
+    }
+    void (async () => {
+      try {
+        const st = await window.tanwei.createSession(draftCwd || undefined);
+        store.current.set(st.id, st);
+        select(st.id);
+        bump();
+        put();
+        toast("info", "已新建会话并写进输入框，确认后点发送");
+      } catch (err) {
+        toast("error", `准备会话失败：${err instanceof Error ? err.message : String(err)}`);
+      }
+    })();
   };
 
   /** 从「发现 / 资产」直接开一个会话，把上下文交给 agent 继续打 */
@@ -423,7 +519,8 @@ export function App() {
   const stateTitle = active?.title || "新会话";
 
   return (
-    <div className="app">
+    <SessionScopeProvider sessionId={activeId} revision={activeState?.updatedAt} busy={Boolean(activeState?.busy)}>
+      <div className="app">
       <header className="titlebar">
         <div className="brand">
           <span className="brand-mark">
@@ -529,6 +626,7 @@ export function App() {
           onNewSession={() => void createSession()}
           onModule={(id: ModuleId) => setView({ kind: "module", id })}
           onRefresh={() => void window.tanwei.refreshSessions()}
+          onDeleteSession={(id) => void deleteSession(id)}
         />
 
         {view.kind === "session" ? (
@@ -561,6 +659,7 @@ export function App() {
               models={visibleModels}
               commands={commands}
               cwd={active?.cwd ?? draftCwd}
+              draft={composerDraft}
               onSend={send}
               onCancel={cancel}
               onMode={changeMode}
@@ -583,9 +682,9 @@ export function App() {
               onOpenSession={(id) => void openSession(id)}
               onCreateSession={() => void createSession()}
               onAsk={askAgent}
+              onStage={stagePrompt}
               onModule={(id: ModuleId) => setView({ kind: "module", id })}
               commands={commands}
-              sessionTasks={activeSessionTasks}
               activeId={activeId}
             />
           </main>
@@ -597,16 +696,59 @@ export function App() {
       </div>
 
       <div className="toasts">
-        {toasts.map((t) => (
-          <div key={t.id} className={`toast ${t.level}`}>
-            <span className="toast-dot" />
-            <span>{t.text}</span>
-            <button className="toast-x" onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}>
-              <Icon name="close" size={11} />
-            </button>
-          </div>
-        ))}
+        {toasts.map((t) =>
+          t.level === "done" ? (
+            <div key={t.id} className="toast toast-done">
+              <div className="toast-done-head">
+                <span className="toast-done-check">
+                  <Icon name="check" size={12} />
+                </span>
+                <span className="toast-done-title">{t.title ?? "任务完成"}</span>
+                <button
+                  className="toast-x"
+                  onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+                >
+                  <Icon name="close" size={11} />
+                </button>
+              </div>
+              <div className="toast-done-text">{t.text}</div>
+              {t.detail?.length ? (
+                <div className="toast-done-meta">
+                  {t.detail.map((d, i) => (
+                    <span key={i}>{d}</span>
+                  ))}
+                </div>
+              ) : null}
+              {t.sessionId ? (
+                <button
+                  className="toast-done-open"
+                  onClick={() => {
+                    void openSession(t.sessionId!);
+                    setToasts((prev) => prev.filter((x) => x.id !== t.id));
+                  }}
+                >
+                  打开会话
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <div key={t.id} className={`toast ${t.level}`}>
+              <span className="toast-dot" />
+              <span className="toast-body">
+                {t.title ? <span className="toast-title">{t.title}</span> : null}
+                <span className="toast-text">{t.text}</span>
+              </span>
+              <button
+                className="toast-x"
+                onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+              >
+                <Icon name="close" size={11} />
+              </button>
+            </div>
+          ),
+        )}
       </div>
-    </div>
+      </div>
+    </SessionScopeProvider>
   );
 }

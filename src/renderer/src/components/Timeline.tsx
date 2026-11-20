@@ -197,15 +197,15 @@ function EmptyState({ mode }: { mode: PermissionMode }) {
       <div className="empty-radar">
         <Icon name="radar" size={48} strokeWidth={1.1} />
       </div>
-      <h2>探微作战台已接管 grok.exe</h2>
+      <h2>天鉴·探微 · 安全测试工作台</h2>
       <p>
-        这里不是套壳聊天框。会话、工具、MCP、技能、规则、权限申请、计划与用量全部走 grok agent 的 ACP 通道，
-        原生 TUI 的全部能力都在。
+        从一句目标开始，到一份能交的报告结束：引擎自己拆资产、抽接口、发请求、验证漏洞，过程实时落到资金图谱、
+        攻击面、流量、任务与报告面板里，不用在终端和表格之间来回搬。
       </p>
       <div className="empty-grid">
         <div className="empty-tile">
-          <span className="empty-k">全能力</span>
-          <span>工具调用、命令行、MCP、Skill、Workflow 与子代理都可用；需要纯终端时点右上「原生 TUI」。</span>
+          <span className="empty-k">测试链路</span>
+          <span>资产梳理 → 接口发现 → 越权 / 注入 / 逻辑验证 → 报告落盘；命令行、MCP、技能与子代理按需调用。</span>
         </div>
         <div className="empty-tile">
           <span className="empty-k">当前模式</span>

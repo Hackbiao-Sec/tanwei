@@ -11,6 +11,18 @@ const MODE_HINT: Record<PermissionMode, string> = {
   "always-approve": "工具全部放行",
 };
 
+/** 面板塞进来的草稿：seq 变了才覆盖输入框，避免打字时被回写 */
+export type ComposerDraft = { text: string; seq: number };
+
+function baseName(p: string): string {
+  return p.split(/[\\/]/).filter(Boolean).pop() ?? p;
+}
+
+function extOf(p: string): string {
+  const m = /\.([a-z0-9]{1,6})$/i.exec(baseName(p));
+  return (m?.[1] ?? "").toLowerCase();
+}
+
 export function Composer({
   disabled,
   busy,
@@ -19,6 +31,7 @@ export function Composer({
   models,
   commands,
   cwd,
+  draft,
   onSend,
   onCancel,
   onMode,
@@ -32,13 +45,16 @@ export function Composer({
   models: ModelInfo[];
   commands: CommandInfo[];
   cwd: string;
-  onSend: (text: string) => void;
+  draft?: ComposerDraft;
+  onSend: (text: string, attachments: string[]) => void;
   onCancel: () => void;
   onMode: (mode: PermissionMode) => void;
   onModel: (id: string) => void;
   onPickFolder: () => void;
 }) {
   const [value, setValue] = useState("");
+  const [files, setFiles] = useState<string[]>([]);
+  const [dropping, setDropping] = useState(false);
   const [paletteIndex, setPaletteIndex] = useState(0);
   const areaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -67,11 +83,60 @@ export function Composer({
     areaRef.current?.focus();
   }, [disabled]);
 
+  // 面板「发到对话框」：只替换输入框内容，发不发由用户自己点
+  useEffect(() => {
+    if (!draft) return;
+    setValue(draft.text);
+    requestAnimationFrame(() => {
+      const el = areaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(draft.text.length, draft.text.length);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft?.seq]);
+
+  const attach = (paths: string[]) => {
+    if (!paths.length) return;
+    setFiles((prev) => {
+      const seen = new Set(prev);
+      const next = [...prev];
+      for (const p of paths) {
+        if (!p || seen.has(p)) continue;
+        seen.add(p);
+        next.push(p);
+      }
+      return next.slice(0, 12);
+    });
+  };
+
+  const pickFiles = async () => {
+    const picked = await window.tanwei.pickFiles().catch(() => [] as string[]);
+    attach(picked);
+  };
+
+  const onDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDropping(false);
+    if (disabled) return;
+    const paths = Array.from(e.dataTransfer.files)
+      .map((f) => {
+        try {
+          return window.tanwei.pathOfFile(f);
+        } catch {
+          return "";
+        }
+      })
+      .filter(Boolean);
+    attach(paths);
+  };
+
   const send = () => {
     const text = value.trim();
     if (!text || disabled) return;
-    onSend(text);
+    onSend(text, files);
     setValue("");
+    setFiles([]);
   };
 
   const applyCommand = (c: CommandInfo) => {
@@ -134,14 +199,46 @@ export function Composer({
         </div>
       ) : null}
 
-      <div className={`composer-box ${disabled ? "off" : ""}`}>
+      <div
+        className={`composer-box ${disabled ? "off" : ""}${dropping ? " dropping" : ""}`}
+        onDragOver={(e) => {
+          if (disabled) return;
+          e.preventDefault();
+          setDropping(true);
+        }}
+        onDragLeave={() => setDropping(false)}
+        onDrop={onDrop}
+      >
+        {files.length > 0 ? (
+          <div className="attach-bar">
+            {files.map((p) => (
+              <span className="attach-chip" key={p} title={p}>
+                <Icon name={extOf(p) === "apk" || extOf(p) === "ipa" ? "android" : "file"} size={11} />
+                <span className="attach-name">{baseName(p)}</span>
+                <span className="attach-ext">{extOf(p) || "文件"}</span>
+                <button
+                  className="attach-x"
+                  title="移除"
+                  onClick={() => setFiles((prev) => prev.filter((x) => x !== p))}
+                >
+                  <Icon name="close" size={10} />
+                </button>
+              </span>
+            ))}
+            <span className="attach-tip">
+              {dropping ? "松手加入" : "路径随消息带给引擎，APP / 小程序页按会话可见"}
+            </span>
+          </div>
+        ) : null}
         <textarea
           ref={areaRef}
           className="composer-input"
           placeholder={
             disabled
               ? "先新建或打开一个会话…"
-              : "说目标，或输入 / 唤出命令。Enter 发送 · Shift+Enter 换行"
+              : files.length
+                ? "说说要拿这个文件做什么，Enter 发送"
+                : "说目标，或输入 / 唤出命令。拖入 APK / 文件可直接附加。Enter 发送 · Shift+Enter 换行"
           }
           value={value}
           rows={1}
@@ -154,6 +251,15 @@ export function Composer({
             <button className="cwd-chip" onClick={onPickFolder} title="切换工作目录">
               <Icon name="folder" size={12} />
               <span className="cwd-text">{cwd || "选择目录"}</span>
+            </button>
+            <button
+              className="cwd-chip attach-pick"
+              onClick={() => void pickFiles()}
+              disabled={disabled}
+              title="上传 APK / IPA / 任意文件，选择后会附加到这条消息"
+            >
+              <Icon name="plus" size={12} />
+              <span>上传文件</span>
             </button>
             <div className="segmented">
               {MODES.map((m) => (
@@ -187,7 +293,10 @@ export function Composer({
             ) : null}
           </div>
           <div className="composer-right">
-            <span className="composer-hint">{value.length > 0 ? `${value.length} 字` : "/ 命令"}</span>
+            <span className="composer-hint">
+              {files.length ? `${files.length} 个附件 · ` : ""}
+              {value.length > 0 ? `${value.length} 字` : "/ 命令"}
+            </span>
             {busy ? (
               <button className="btn stop-btn" onClick={onCancel} title="中止本回合">
                 <Icon name="stop" size={13} />

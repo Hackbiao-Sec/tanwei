@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARL-X · 资产侦察灯塔（增强版）</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--panel2:#1e222b;--line:#2a2f3a;--fg:#e6e9ef;--dim:#8b93a3;
+--acc:#4f8cff;--ok:#37c26b;--warn:#f0a020;--err:#e5484d;--mono:"Cascadia Mono",Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 "Segoe UI","Microsoft YaHei",sans-serif}
+a{color:var(--acc);text-decoration:none}
+.hidden{display:none!important}
+button{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:6px;
+padding:6px 12px;cursor:pointer;font-size:13px}
+button:hover{border-color:var(--acc)}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.danger{border-color:var(--err);color:var(--err)}
+button.sm{padding:3px 8px;font-size:12px}
+input,select,textarea{background:#0b0d12;color:var(--fg);border:1px solid var(--line);border-radius:6px;
+padding:7px 9px;font-size:13px;width:100%;font-family:inherit}
+textarea{resize:vertical;font-family:var(--mono)}
+label{display:block;color:var(--dim);font-size:12px;margin:8px 0 3px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:14px;color:#cfd6e4}
+.login-wrap{display:flex;align-items:center;justify-content:center;height:100vh}
+.login{width:340px}
+.login h1{font-size:20px;margin:0 0 4px}
+.login p{color:var(--dim);font-size:12px;margin:0 0 18px}
+header{display:flex;align-items:center;gap:16px;padding:10px 18px;background:var(--panel);
+border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}
+header .brand{font-weight:700;letter-spacing:.4px}
+header .brand small{color:var(--dim);font-weight:400;margin-left:6px}
+nav{display:flex;gap:4px;flex-wrap:wrap}
+nav button{background:transparent;border:none;color:var(--dim);padding:6px 12px;border-radius:6px}
+nav button.on{background:var(--panel2);color:var(--fg)}
+main{padding:16px 18px;max-width:1600px;margin:0 auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--dim);font-weight:500;position:sticky;top:0;background:var(--panel)}
+td.mono,.mono{font-family:var(--mono);font-size:12px}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;background:var(--panel2);
+border:1px solid var(--line);font-size:11px;margin-right:4px}
+.tag.ok{color:var(--ok);border-color:#1d3d2a}.tag.warn{color:var(--warn);border-color:#4a3a12}
+.tag.err{color:var(--err);border-color:#4a1f22}
+.logbox{background:#080a0e;border:1px solid var(--line);border-radius:8px;height:340px;overflow:auto;
+padding:8px 10px;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-all}
+.logbox .warn{color:var(--warn)}.logbox .error{color:var(--err)}.logbox .info{color:#9fb2cc}
+.bar{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,#3b6dff,#37c26b);width:0}
+.chk{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--fg);margin:4px 0}
+.chk input{width:auto}
+.pill{background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:2px 9px;
+font-size:12px;cursor:pointer;user-select:none}
+.pill.on{border-color:var(--acc);color:#cfe0ff;background:#16233b}
+.muted{color:var(--dim)}
+.right{margin-left:auto}
+pre.detail{background:#080a0e;border:1px solid var(--line);border-radius:8px;padding:10px;
+max-height:420px;overflow:auto;font-size:12px}
+.tabs-mini{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+#toast{position:fixed;right:18px;bottom:18px;z-index:99;display:flex;flex-direction:column;gap:8px}
+#toast div{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 14px;
+font-size:13px;box-shadow:0 6px 20px #0008}
+</style>
+</head>
+<body>
+<div id="toast"></div>
+<div id="login" class="login-wrap">
+  <div class="card login">
+    <h1>ARL-X 灯塔</h1>
+    <p>资产侦察 · 企业主体 / 子域 / 指纹 / 泄露 / 旁站</p>
+    <label for="lu">用户名</label><input id="lu" autocomplete="username" value="admin">
+    <label for="lp">密码</label><input id="lp" type="password" autocomplete="current-password">
+    <div style="height:14px"></div>
+    <button class="primary" style="width:100%" id="loginBtn">登 录</button>
+    <p style="margin-top:12px">默认 admin / arlpass，登录后请到「配置」修改密码</p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+<header>
+  <div class="brand">ARL-X<small>资产侦察灯塔 · 增强版</small></div>
+  <nav>
+    <button data-tab="scan" class="on">任务下发</button>
+    <button data-tab="tasks">任务列表</button>
+    <button data-tab="assets">资产</button>
+    <button data-tab="stats">统计</button>
+    <button data-tab="search">空间测绘</button>
+    <button data-tab="sched">计划任务</button>
+    <button data-tab="settings">配置</button>
+    <button data-tab="audit">审计</button>
+  </nav>
+  <div class="right row">
+    <span class="muted mono" id="whoami"></span>
+    <button id="logoutBtn" class="sm">退出</button>
+  </div>
+</header>
+
+<main>
+<!-- ───── 任务下发 ───── -->
+<section id="tab-scan" class="tab">
+  <div class="grid2">
+    <div class="card">
+      <h3>目标</h3>
+      <label for="targets">域名 / IP / IP段 / 企业名称（逗号或换行分隔）</label>
+      <textarea id="targets" rows="5" placeholder="example.com&#10;10.0.0.0/24&#10;某某科技有限公司"></textarea>
+      <label for="tname">任务名称（可空）</label>
+      <input id="tname" placeholder="例：某集团 2026 全量">
+      <div class="row" style="margin-top:12px">
+        <button class="primary" id="startBtn">下发任务</button>
+        <button id="loadTpl">载入模板</button>
+        <span class="muted" id="tplName"></span>
+      </div>
+    </div>
+    <div class="card">
+      <h3>阶段开关</h3>
+      <div class="grid2">
+        <label class="chk"><input type="checkbox" id="opt-enterprise" checked>企业主体（ICP/别名/AI）</label>
+        <label class="chk"><input type="checkbox" id="opt-brute" checked>字典爆破</label>
+        <label class="chk"><input type="checkbox" id="opt-dnsgen" checked>dnsgen 变体</label>
+        <label class="chk"><input type="checkbox" id="opt-port" checked>端口扫描</label>
+        <label class="chk"><input type="checkbox" id="opt-crawl" checked>站点爬虫 + JS</label>
+        <label class="chk"><input type="checkbox" id="opt-leak" checked>敏感文件 + Git</label>
+        <label class="chk"><input type="checkbox" id="opt-vhost">VHost 碰撞</label>
+        <label class="chk"><input type="checkbox" id="opt-sibling" checked>旁站 / C 段 / 桶</label>
+        <label class="chk"><input type="checkbox" id="opt-deep" checked>深度挖掘（代码泄露/邮箱）</label>
+      </div>
+      <div class="grid3" style="margin-top:10px">
+        <div><label for="portType">端口组</label>
+          <select id="portType"><option value="top10">TOP10</option><option value="top100">TOP100</option>
+            <option value="top1000" selected>TOP1000</option><option value="custom">自定义</option></select></div>
+        <div><label for="portCustom">自定义端口</label><input id="portCustom" placeholder="80,443,1-1000"></div>
+        <div><label for="probeLimit">存活探测上限</label><input id="probeLimit" value="3000"></div>
+      </div>
+      <div class="grid2" style="margin-top:10px">
+        <div><label for="bruteDict">爆破字典</label><select id="bruteDict"></select></div>
+        <div><label for="leakDict">敏感文件字典</label><select id="leakDict"></select></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="saveTpl" class="sm">保存为模板</button>
+        <button id="clearTpl" class="sm">清空模板</button>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <h3>被动数据源（勾选启用，灰色为未配置 Key）</h3>
+    <div id="srcList" class="row" style="gap:8px"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="srcAll" class="sm">全选免费源</button>
+      <button id="srcNone" class="sm">全不选</button>
+      <span class="muted">未配置 key 的源默认跳过；免费源含 CT 多镜像</span>
+    </div>
+  </div>
+  <div class="card" id="runCard">
+    <h3>当前运行 <span class="muted mono" id="runId"></span></h3>
+    <div class="bar"><i id="runBar"></i></div>
+    <div class="row" style="margin:6px 0 10px">
+      <span id="runMsg" class="muted"></span>
+      <button class="sm" id="stopBtn">停止</button>
+    </div>
+    <div class="logbox" id="logbox"></div>
+  </div>
+</section>
+
+<!-- ───── 任务列表 ───── -->
+<section id="tab-tasks" class="tab hidden">
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <h3 style="margin:0">任务</h3>
+      <button class="sm right" id="refreshTasks">刷新</button>
+    </div>
+    <table><thead><tr><th>任务</th><th>目标</th><th>状态</th><th>进度</th><th>阶段</th>
+      <th>统计</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody id="taskList"></tbody></table>
+  </div>
+</section>
+
+<!-- ───── 资产 ───── -->
+<section id="tab-assets" class="tab hidden">
+  <div class="card">
+    <div class="row">
+      <select id="fKind" style="width:150px">
+        <option value="">全部类型</option><option>domain</option><option>ip</option><option>site</option>
+        <option>service</option><option>api</option><option>js</option><option>leak</option>
+        <option>leakfile</option><option>git</option><option>email</option><option>bucket</option>
+        <option>codeleak</option><option>enterprise</option><option>mailinfo</option>
+        <option>vhost</option><option>sibling</option><option>nuclei</option><option>screenshot</option>
+      </select>
+      <input id="fKeyword" placeholder="关键字：URL / 标题 / 指纹 / 主机" style="flex:1;min-width:200px">
+      <select id="fTask" style="width:220px"><option value="">全部任务</option></select>
+      <label class="muted" style="display:flex;align-items:center;gap:4px;white-space:nowrap">
+        <input type="checkbox" id="fOnlyNew" style="width:auto" onclick="window.toggleOnlyNew()">仅看新增
+      </label>
+      <button class="primary" id="searchAssets">查询</button>
+      <button id="exportCsv">导出 CSV</button>
+      <button id="exportJson">导出 JSON</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="muted" id="assetTotal"></span>
+      <div class="right row">
+        <button class="sm" id="prevPage">上一页</button>
+        <span class="muted" id="pageInfo"></span>
+        <button class="sm" id="nextPage">下一页</button>
+      </div>
+    </div>
+  </div>
+  <div class="card" style="padding:0;overflow:auto;max-height:70vh">
+    <table><thead><tr><th>类型</th><th>URL / 标识</th><th>主机</th><th>IP</th><th>端口</th>
+      <th>标题</th><th>状态</th><th>指纹</th><th>CDN</th><th>来源</th></tr></thead>
+      <tbody id="assetList"></tbody></table>
+  </div>
+</section>
+
+<!-- ───── 统计 ───── -->
+<section id="tab-stats" class="tab hidden">
+  <div class="card"><h3>类型分布</h3><div id="statKinds"></div></div>
+  <div class="grid2">
+    <div class="card"><h3>Top 指纹</h3><div id="statFp"></div></div>
+    <div class="card"><h3>Top 根域</h3><div id="statRoots"></div></div>
+  </div>
+  <div class="card"><h3>Top 端口</h3><div id="statPorts"></div></div>
+  <div class="card"><h3>资产变更（相对该根域上一轮快照）</h3>
+    <div class="row" style="margin-bottom:8px">
+      <input id="diffRoot" placeholder="留空=全部根域" style="width:220px">
+      <button class="sm" id="diffLoad">查询新增</button>
+      <span class="muted">新增项在资产页会标「NEW」</span>
+    </div>
+    <table><thead><tr><th>根域</th><th>时间</th><th>本轮总数</th><th>新增</th></tr></thead>
+      <tbody id="diffList"></tbody></table>
+  </div>
+</section>
+
+<!-- ───── 空间测绘 ───── -->
+<section id="tab-search" class="tab hidden">
+  <div class="card">
+    <h3>空间测绘通用查询</h3>
+    <div class="row">
+      <select id="seEngine" style="width:140px"><option value="fofa">FOFA</option></select>
+      <input id="seQuery" placeholder='例：app="Apache" && country="CN" || icon_hash="116323821"' style="flex:1">
+      <input id="seSize" value="100" style="width:100px">
+      <button class="primary" id="seRun">查询</button>
+    </div>
+    <p class="muted" style="margin:8px 0 0">FOFA 语法任意组合；结果可一键下发到「目标」继续挖。</p>
+  </div>
+  <div class="card" style="padding:0;overflow:auto;max-height:65vh">
+    <table><thead><tr id="seHead"></tr></thead><tbody id="seBody"></tbody></table>
+  </div>
+</section>
+
+<!-- ───── 计划任务 ───── -->
+<section id="tab-sched" class="tab hidden">
+  <div class="card">
+    <h3>新建周期任务</h3>
+    <div class="grid3">
+      <div><label for="schName">名称</label><input id="schName"></div>
+      <div><label for="schTarget">目标</label><input id="schTarget"></div>
+      <div><label for="schHours">间隔（小时）</label><input id="schHours" value="24"></div>
+    </div>
+    <div class="row" style="margin-top:10px"><button class="primary" id="schAdd">保存</button></div>
+  </div>
+  <div class="card"><table><thead><tr><th>名称</th><th>目标</th><th>间隔</th><th>上次</th>
+    <th>下次</th><th>启用</th><th>操作</th></tr></thead><tbody id="schList"></tbody></table></div>
+</section>
+
+<!-- ───── 配置 ───── -->
+<section id="tab-settings" class="tab hidden">
+  <div class="row" style="margin-bottom:10px">
+    <button class="primary" id="saveCfg">保存配置</button>
+    <button id="testProxy">测试代理</button>
+    <span class="muted">密钥显示为 ***，保持不变即不覆盖</span>
+  </div>
+  <div class="card"><h3>服务</h3><div class="grid3" id="cfgServer"></div></div>
+  <div class="card"><h3>代理</h3><div class="grid3" id="cfgProxy"></div></div>
+  <div class="card"><h3>数据源 Key</h3><div class="grid2" id="cfgSources"></div></div>
+  <div class="card"><h3>扫描 / 深度 / 通知</h3><div class="grid3" id="cfgScan"></div></div>
+</section>
+
+<!-- ───── 审计 ───── -->
+<section id="tab-audit" class="tab hidden">
+  <div class="card"><table><thead><tr><th>时间</th><th>用户</th><th>动作</th><th>目标</th>
+    <th>详情</th></tr></thead><tbody id="auditList"></tbody></table></div>
+</section>
+</main>
+</div>
+<script>
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+let TOKEN = localStorage.getItem('arlx_token') || '';
+let SRC_META = [];
+let CFG = {};
+let PAGE = 0;
+const PAGE_SIZE = 100;
+let CUR_TASK = '';
+let ES = null;
+
+function toast(msg, ms = 2600) {
+  const d = document.createElement('div');
+  d.textContent = msg;
+  $('#toast').appendChild(d);
+  setTimeout(() => d.remove(), ms);
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+async function api(path, opt = {}) {
+  const o = Object.assign({headers: {}}, opt);
+  o.headers['Content-Type'] = 'application/json';
+  if (TOKEN) o.headers['X-Token'] = TOKEN;
+  const r = await fetch(path, o);
+  if (r.status === 401) { showLogin(); throw new Error('未登录'); }
+  const ct = r.headers.get('content-type') || '';
+  if (!ct.includes('json')) return r;
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.detail || ('HTTP ' + r.status));
+  return j;
+}
+function showLogin() { $('#login').classList.remove('hidden'); $('#app').classList.add('hidden'); }
+function showApp() { $('#login').classList.add('hidden'); $('#app').classList.remove('hidden'); }
+
+async function doLogin() {
+  const r = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({username: $('#lu').value.trim(), password: $('#lp').value})});
+  if (!r.ok) { toast('登录失败：用户名或密码错误'); return; }
+  const j = await r.json();
+  TOKEN = j.token; localStorage.setItem('arlx_token', TOKEN);
+  await boot();
+}
+window.doLogin = doLogin;
+window.arlxLogin = async function (u, p) {           // 脚本/自动化用：直接拿 token
+  const r = await fetch('/api/login', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({username: u, password: p})});
+  const j = await r.json(); TOKEN = j.token; localStorage.setItem('arlx_token', TOKEN);
+  await boot(); return TOKEN;
+};
+$('#loginBtn').onclick = doLogin;
+$('#lp').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+$('#logoutBtn').onclick = async () => {
+  try { await api('/api/logout', {method: 'POST'}); } catch (e) {}
+  TOKEN = ''; localStorage.removeItem('arlx_token'); showLogin();
+};
+
+// ───────── 标签 ─────────
+$$('nav button').forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
+function switchTab(name) {
+  $$('nav button').forEach((x) => x.classList.toggle('on', x.dataset.tab === name));
+  $$('.tab').forEach((x) => x.classList.add('hidden'));
+  const el = $('#tab-' + name);
+  if (el) el.classList.remove('hidden');
+  if (name === 'tasks') loadTasks();
+  if (name === 'assets') loadAssets();
+  if (name === 'stats') loadStats();
+  if (name === 'sched') loadSched();
+  if (name === 'audit') loadAudit();
+  if (name === 'settings') loadCfg();
+}
+
+// ───────── 启动 ─────────
+async function boot() {
+  try { const me = await api('/api/me'); $('#whoami').textContent = me.username + ' · v' + me.version; }
+  catch (e) { return; }
+  showApp();
+  await loadSources();
+  await loadOptions();
+  await loadCfg();
+  await loadTasks();
+  if (!location.hash || location.hash === '#') loadAssets();
+}
+
+async function loadOptions() {
+  const j = await api('/api/options');
+  const dicts = j.dicts || [];
+  const bd = $('#bruteDict'), ld = $('#leakDict');
+  dicts.forEach((d) => {
+    if (/domain|alt|sub/i.test(d)) bd.insertAdjacentHTML('beforeend', `<option>${esc(d)}</option>`);
+    if (/file/i.test(d)) ld.insertAdjacentHTML('beforeend', `<option>${esc(d)}</option>`);
+  });
+  bd.value = 'domain_2w.txt'; ld.value = 'file_top_200.txt';
+}
+
+async function loadSources() {
+  const j = await api('/api/sources');
+  SRC_META = j.items || [];
+  const box = $('#srcList');
+  box.innerHTML = SRC_META.map((s) => {
+    const needKey = s.need_key;
+    const hasKey = CFG.sources && CFG.sources[s.name] && (CFG.sources[s.name].key || CFG.sources[s.name].token);
+    const disabled = needKey && !hasKey;
+    return `<span class="pill ${disabled ? '' : 'on'}" data-src="${esc(s.name)}" ${disabled ? 'title="未配置 Key"' : ''}
+      style="${disabled ? 'opacity:.45;cursor:not-allowed' : ''}">${esc(s.name)}${needKey ? ' 🔑' : ''}</span>`;
+  }).join('');
+  $$('#srcList .pill').forEach((p) => p.onclick = () => {
+    if (p.style.opacity === '0.45') return;
+    p.classList.toggle('on');
+  });
+}
+$('#srcAll').onclick = () => { $$('#srcList .pill').forEach((p) => { if (p.style.opacity !== '0.45') p.classList.add('on'); }); };
+$('#srcNone').onclick = () => { $$('#srcList .pill').forEach((p) => p.classList.remove('on')); };
+
+// ───────── 下发任务 ─────────
+function collectOptions() {
+  const sources = $$('#srcList .pill.on').map((p) => p.dataset.src);
+  return {
+    enterprise: $('#opt-enterprise').checked,
+    domain_brute: $('#opt-brute').checked,
+    alt_dns: $('#opt-dnsgen').checked,
+    port_scan: $('#opt-port').checked,
+    site_spider: $('#opt-crawl').checked,
+    file_leak: $('#opt-leak').checked,
+    vhost_collision: $('#opt-vhost').checked,
+    sibling: $('#opt-sibling').checked,
+    deep: $('#opt-deep').checked,
+    port_type: $('#portType').value,
+    port_custom: $('#portCustom').value,
+    probe_limit: parseInt($('#probeLimit').value || '3000', 10),
+    domain_dict: $('#bruteDict').value,
+    file_leak_dict: $('#leakDict').value,
+    sources: sources,
+  };
+}
+$('#startBtn').onclick = async () => {
+  const targets = $('#targets').value.trim();
+  if (!targets) { toast('请填写目标'); return; }
+  const btn = $('#startBtn'); btn.disabled = true;
+  try {
+    const j = await api('/api/tasks', {method: 'POST', body: JSON.stringify({
+      targets, name: $('#tname').value.trim(), options: collectOptions()})});
+    toast('任务已下发：' + j.task_id);
+    watch(j.task_id);
+  } catch (e) { toast('下发失败：' + e.message); }
+  btn.disabled = false;
+};
+$('#saveTpl').onclick = async () => {
+  const name = prompt('模板名');
+  if (!name) return;
+  try { await api('/api/templates', {method: 'POST', body: JSON.stringify({name, options: collectOptions()})});
+    toast('模板已保存'); } catch (e) { toast(e.message); }
+};
+$('#loadTpl').onclick = async () => {
+  const j = await api('/api/templates');
+  if (!j.items.length) { toast('暂无模板'); return; }
+  const name = prompt('输入模板名：\n' + j.items.map((t) => t.name).join('\n'));
+  const t = j.items.find((x) => x.name === name);
+  if (!t) { toast('模板不存在'); return; }
+  const o = t.options || {};
+  $('#opt-enterprise').checked = !!o.enterprise;
+  $('#opt-brute').checked = !!o.domain_brute;
+  $('#opt-dnsgen').checked = !!o.alt_dns;
+  $('#opt-port').checked = !!o.port_scan;
+  $('#opt-crawl').checked = !!o.site_spider;
+  $('#opt-leak').checked = !!o.file_leak;
+  $('#opt-vhost').checked = !!o.vhost_collision;
+  $('#opt-sibling').checked = !!o.sibling;
+  $('#opt-deep').checked = !!o.deep;
+  if (o.port_type) $('#portType').value = o.port_type;
+  if (o.sources) $$('#srcList .pill').forEach((p) => p.classList.toggle('on', o.sources.includes(p.dataset.src)));
+  $('#tplName').textContent = '已载入：' + t.name;
+};
+$('#clearTpl').onclick = () => { $('#tplName').textContent = ''; };
+
+// ───────── 实时日志 ─────────
+function watch(taskId) {
+  CUR_TASK = taskId;
+  $('#runId').textContent = taskId;
+  $('#logbox').innerHTML = '';
+  $('#runMsg').textContent = '连接中…';
+  if (ES) ES.close();
+  const q = TOKEN ? ('?token=' + encodeURIComponent(TOKEN)) : '';
+  ES = new EventSource('/api/tasks/' + taskId + '/stream' + q);
+  ES.onmessage = (ev) => {
+    try {
+      const r = JSON.parse(ev.data);
+      const line = document.createElement('div');
+      line.className = r.level || 'info';
+      line.textContent = `[${(r.module || '')}] ${r.msg}`;
+      $('#logbox').appendChild(line);
+      $('#logbox').scrollTop = $('#logbox').scrollHeight;
+    } catch (e) {}
+  };
+  ES.addEventListener('state', (ev) => {
+    try {
+      const s = JSON.parse(ev.data);
+      $('#runBar').style.width = (s.progress || 0) + '%';
+      const st = {running: '运行中', done: '已完成', error: '异常', stopped: '已停止', stopping: '停止中'}[s.status] || s.status;
+      $('#runMsg').textContent = `${st} · ${s.progress || 0}% · ${s.phase || ''} ${s.message || ''}`;
+      if (['done', 'error', 'stopped'].includes(s.status)) { ES.close(); loadTasks(); }
+    } catch (e) {}
+  });
+  ES.onerror = () => { $('#runMsg').textContent = '日志连接断开（任务可能仍在运行）'; };
+}
+$('#stopBtn').onclick = async () => { if (CUR_TASK) { await api('/api/tasks/' + CUR_TASK + '/stop', {method: 'POST'}); toast('已请求停止'); } };
+
+// ───────── 任务列表 ─────────
+$('#refreshTasks').onclick = loadTasks;
+async function loadTasks() {
+  const j = await api('/api/tasks?limit=100');
+  const tb = $('#taskList');
+  tb.innerHTML = (j.items || []).map((t) => {
+    const stats = Object.entries(t.stats || {}).filter(([k, v]) => typeof v === 'number' && v)
+      .map(([k, v]) => `${k}:${v}`).join(' ');
+    const stTag = {done: 'ok', error: 'err', running: '', stopped: 'warn'}[t.status] || '';
+    return `<tr><td>${esc(t.name)}<div class="muted mono">${esc(t.id)}</div></td>
+      <td class="mono">${esc((t.target || '').slice(0, 60))}</td>
+      <td><span class="tag ${stTag}">${esc(t.status)}</span></td>
+      <td style="width:110px">${t.progress || 0}%<div class="bar"><i style="width:${t.progress || 0}%"></i></div></td>
+      <td>${esc(t.phase || '')}<div class="muted">${esc(t.message || '')}</div></td>
+      <td class="mono">${esc(stats)}</td>
+      <td class="mono">${esc(new Date((t.created_at || 0) * 1000).toLocaleString())}</td>
+      <td><button class="sm" onclick="watchTask('${t.id}')">日志</button>
+        <button class="sm" onclick="viewTaskAssets('${t.id}')">资产</button>
+        <button class="sm" onclick="rerun('${t.id}')">重跑</button></td></tr>`;
+  }).join('');
+  const sel = $('#fTask');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">全部任务</option>' + (j.items || []).map((t) =>
+    `<option value="${t.id}">${esc(t.name)} (${t.id})</option>`).join('');
+  sel.value = cur;
+}
+window.watchTask = (id) => { switchTab('scan'); watch(id); };
+window.viewTaskAssets = (id) => { switchTab('assets'); $('#fTask').value = id; PAGE = 0; loadAssets(); };
+window.rerun = async (id) => { const j = await api('/api/tasks/' + id + '/rerun', {method: 'POST'}); toast('已重跑：' + j.task_id); loadTasks(); };
+
+// ───────── 资产 ─────────
+function assetFilters() {
+  const onlyNew = document.getElementById('fOnlyNew');
+  return {
+    kind: $('#fKind').value,
+    keyword: $('#fKeyword').value.trim(),
+    task_id: $('#fTask').value,
+    is_new: onlyNew && onlyNew.checked ? 1 : '',
+    limit: PAGE_SIZE,
+    offset: PAGE * PAGE_SIZE,
+  };
+}
+async function loadAssets() {
+  const f = assetFilters();
+  const qs = new URLSearchParams();
+  Object.entries(f).forEach(([k, v]) => { if (v !== '' && v != null) qs.set(k, v); });
+  const j = await api('/api/assets?' + qs.toString());
+  $('#assetTotal').textContent = `共 ${j.total} 条`;
+  $('#pageInfo').textContent = `第 ${PAGE + 1} 页`;
+  $('#assetList').innerHTML = (j.items || []).map((a) => {
+    const url = a.kind === 'site' ? `<a href="${esc(a.url)}" target="_blank" rel="noreferrer">${esc(a.url)}</a>` : esc(a.url);
+    const fresh = a.is_new ? ' <span class="tag ok">NEW</span>' : '';
+    return `<tr><td><span class="tag">${esc(a.kind)}</span></td><td class="mono">${url}${fresh}</td>
+      <td class="mono">${esc(a.host || '')}</td><td class="mono">${esc(a.ip || '')}</td>
+      <td>${esc(a.port || '')}</td><td>${esc((a.title || '').slice(0, 50))}</td>
+      <td>${esc(a.status_code || '')}</td><td class="mono">${esc((a.fingerprint || '').slice(0, 60))}</td>
+      <td>${esc(a.cdn || '')}</td><td class="muted mono">${esc((a.sources || '').slice(0, 40))}</td></tr>`;
+  }).join('');
+}
+$('#searchAssets').onclick = () => { PAGE = 0; loadAssets(); };
+window.toggleOnlyNew = function () { PAGE = 0; loadAssets(); };
+$('#fKeyword').addEventListener('keydown', (e) => { if (e.key === 'Enter') { PAGE = 0; loadAssets(); } });
+$('#prevPage').onclick = () => { if (PAGE > 0) { PAGE--; loadAssets(); } };
+$('#nextPage').onclick = () => { PAGE++; loadAssets(); };
+function exportUrl(fmt) {
+  const f = assetFilters();
+  const qs = new URLSearchParams({fmt});
+  ['kind', 'keyword', 'task_id'].forEach((k) => { if (f[k]) qs.set(k, f[k]); });
+  if (TOKEN) qs.set('token', TOKEN);
+  return '/api/export?' + qs.toString();
+}
+$('#exportCsv').onclick = () => window.open(exportUrl('csv'));
+$('#exportJson').onclick = () => window.open(exportUrl('json'));
+
+// ───────── 统计 ─────────
+async function loadStats() {
+  const j = await api('/api/stats');
+  const bars = (obj) => {
+    const arr = Object.entries(obj || {}).sort((a, b) => b[1] - a[1]).slice(0, 25);
+    const max = Math.max(1, ...arr.map((x) => x[1]));
+    return arr.map(([k, v]) => `<div class="row" style="margin:3px 0">
+      <span class="mono" style="width:220px;overflow:hidden">${esc(k)}</span>
+      <div class="bar" style="flex:1"><i style="width:${Math.round(v / max * 100)}%"></i></div>
+      <span class="mono" style="width:60px;text-align:right">${v}</span></div>`).join('') || '<span class="muted">暂无</span>';
+  };
+  $('#statKinds').innerHTML = bars(j.by_kind);
+  $('#statFp').innerHTML = bars(Object.fromEntries((j.top_fingerprints || []).map((x) => [x.fingerprint, x.count])));
+  $('#statRoots').innerHTML = bars(Object.fromEntries((j.top_roots || []).map((x) => [x.root_domain, x.count])));
+  $('#statPorts').innerHTML = bars(Object.fromEntries((j.top_ports || []).map((x) => [String(x.port), x.count])));
+  loadDiff();
+}
+
+// ───────── 资产变更 ─────────
+async function loadDiff() {
+  try {
+    const root = $('#diffRoot').value.trim();
+    const j = await api('/api/diff' + (root ? '?root=' + encodeURIComponent(root) : ''));
+    const items = j.items || [];
+    $('#diffList').innerHTML = items.map((d) => `<tr>
+      <td class="mono">${esc(d.root_domain)}</td>
+      <td class="mono">${esc(new Date((d.created_at || 0) * 1000).toLocaleString())}</td>
+      <td>${d.count}</td>
+      <td>${d.new_count ? `<span class="tag ok">+${d.new_count}</span>` : '0'}</td></tr>`).join('')
+      || '<tr><td colspan="4" class="muted">暂无快照（跑完一轮后自动生成）</td></tr>';
+  } catch (e) { /* 非致命 */ }
+}
+$('#diffLoad').onclick = () => loadDiff();
+$('#diffRoot').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadDiff(); });
+
+// ───────── 空间测绘 ─────────
+$('#seRun').onclick = async () => {
+  const q = $('#seQuery').value.trim();
+  if (!q) { toast('请输入查询语句'); return; }
+  try {
+    const j = await api('/api/search', {method: 'POST', body: JSON.stringify({
+      engine: $('#seEngine').value, query: q, size: parseInt($('#seSize').value || '100', 10)})});
+    if (!j.ok) { toast(j.msg || '查询失败'); return; }
+    const items = j.items || [];
+    const cols = items.length ? Object.keys(items[0]) : [];
+    $('#seHead').innerHTML = cols.map((c) => `<th>${esc(c)}</th>`).join('') + '<th>操作</th>';
+    $('#seBody').innerHTML = items.map((it, i) => {
+      const tds = cols.map((c) => `<td class="mono">${esc(String(it[c] == null ? '' : it[c]).slice(0, 120))}</td>`).join('');
+      return `<tr>${tds}<td><button class="sm" onclick="addTarget('${esc(String(it.host || it.ip || it.domain || '').replace(/['"\\]/g, ''))}')">加入目标</button></td></tr>`;
+    }).join('');
+    toast(`返回 ${items.length} 条`);
+  } catch (e) { toast(e.message); }
+};
+window.addTarget = (h) => {
+  if (!h) return;
+  const ta = $('#targets');
+  ta.value = (ta.value ? ta.value.trim() + '\n' : '') + h;
+  toast('已加入目标：' + h);
+};
+
+// ───────── 计划任务 ─────────
+$('#schAdd').onclick = async () => {
+  const target = $('#schTarget').value.trim();
+  if (!target) { toast('请填写目标'); return; }
+  await api('/api/schedules', {method: 'POST', body: JSON.stringify({
+    name: $('#schName').value.trim(), target, interval_hours: parseInt($('#schHours').value || '24', 10),
+    options: collectOptions(), enabled: true})});
+  toast('已保存'); loadSched(); $('#schName').value = ''; $('#schTarget').value = '';
+};
+async function loadSched() {
+  const j = await api('/api/schedules');
+  $('#schList').innerHTML = (j.items || []).map((s) => `<tr>
+    <td>${esc(s.name)}</td><td class="mono">${esc(s.target)}</td><td>${s.interval_hours}h</td>
+    <td class="mono">${s.last_run ? esc(new Date(s.last_run * 1000).toLocaleString()) : '-'}</td>
+    <td class="mono">${s.next_run ? esc(new Date(s.next_run * 1000).toLocaleString()) : '-'}</td>
+    <td>${s.enabled ? '<span class="tag ok">是</span>' : '<span class="tag warn">否</span>'}</td>
+    <td><button class="sm" onclick="toggleSched('${s.id}',${s.enabled ? 1 : 0})">${s.enabled ? '暂停' : '启用'}</button>
+      <button class="sm danger" onclick="delSched('${s.id}')">删除</button></td></tr>`).join('')
+    || '<tr><td colspan="7" class="muted">暂无计划任务</td></tr>';
+}
+window.toggleSched = async (id, enabled) => {
+  await api('/api/schedules/' + id, {method: 'PATCH', body: JSON.stringify({enabled: !enabled})});
+  loadSched();
+};
+window.delSched = async (id) => { await api('/api/schedules/' + id, {method: 'DELETE'}); loadSched(); };
+
+// ───────── 配置 ─────────
+function field(obj, path, label, type = 'text', opts = {}) {
+  const val = path.split('.').reduce((n, k) => (n == null ? n : n[k]), obj);
+  const id = 'cfg-' + path.replace(/\./g, '-');
+  if (type === 'checkbox') {
+    return `<label class="chk"><input type="checkbox" id="${id}" data-path="${path}" ${val ? 'checked' : ''}>${esc(label)}</label>`;
+  }
+  if (type === 'select') {
+    const os = (opts.choices || []).map((c) => `<option value="${esc(c)}" ${String(c) === String(val) ? 'selected' : ''}>${esc(c)}</option>`).join('');
+    return `<div><label>${esc(label)}</label><select id="${id}" data-path="${path}">${os}</select></div>`;
+  }
+  if (type === 'textarea') {
+    return `<div><label>${esc(label)}</label><textarea id="${id}" data-path="${path}" rows="3">${esc(Array.isArray(val) ? val.join('\n') : (val || ''))}</textarea></div>`;
+  }
+  return `<div><label>${esc(label)}</label><input id="${id}" data-path="${path}" type="${type}" value="${esc(val == null ? '' : val)}"></div>`;
+}
+async function loadCfg() {
+  const j = await api('/api/config');
+  CFG = j.config || {};
+  await loadSources();
+  $('#cfgServer').innerHTML = field(CFG, 'server.host', '监听地址') + field(CFG, 'server.port', '端口') +
+    field(CFG, 'server.auth', '开启登录鉴权', 'checkbox') + field(CFG, 'server.api_key', '开放 API Key（Token 头直通）', 'password');
+  $('#cfgProxy').innerHTML = field(CFG, 'proxy.url', '代理地址（如 http://127.0.0.1:7897）') +
+    field(CFG, 'proxy.sources_via_proxy', '数据源走代理', 'checkbox') +
+    field(CFG, 'proxy.scan_via_proxy', '目标探测走代理（国内目标建议关）', 'checkbox');
+  const srcs = CFG.sources || {};
+  $('#cfgSources').innerHTML = Object.keys(srcs).map((k) => {
+    const sec = srcs[k] || {};
+    const keys = Object.keys(sec).filter((x) => x !== 'enabled' && x !== 'api' && x !== 'model' && x !== 'size');
+    const preview = sec.api ? ` <span class="muted mono">${esc(sec.api)}</span>` : '';
+    return `<div class="card" style="margin:0;padding:10px"><h3>${esc(k)}${preview}</h3>` +
+      field(CFG, 'sources.' + k + '.enabled', '启用', 'checkbox') +
+      keys.map((x) => field(CFG, `sources.${k}.${x}`, x, /key|token|secret|sk/i.test(x) ? 'password' : 'text')).join('') +
+      ` <button class="sm" onclick="testSource('${k}')">测试</button></div>`;
+  }).join('');
+  $('#cfgScan').innerHTML =
+    field(CFG, 'http.concurrent', 'HTTP 并发') + field(CFG, 'http.timeout', 'HTTP 超时(秒)') +
+    field(CFG, 'scan.domain_brute_concurrent', 'DNS 并发') + field(CFG, 'scan.port_type', '默认端口组', 'select', {choices: ['top10', 'top100', 'top1000', 'custom']}) +
+    field(CFG, 'scan.port_concurrent', '端口并发') + field(CFG, 'scan.site_spider', '默认爬虫', 'checkbox') +
+    field(CFG, 'scan.file_leak', '默认敏感文件', 'checkbox') + field(CFG, 'scan.sibling', '默认旁站', 'checkbox') +
+    field(CFG, 'deep.code_leak', '代码泄露搜索', 'checkbox') + field(CFG, 'deep.email_harvest', '邮箱收集', 'checkbox') +
+    field(CFG, 'deep.screenshot', 'Playwright 截图', 'checkbox') + field(CFG, 'deep.nuclei', 'nuclei 复核', 'checkbox') +
+    field(CFG, 'deep.nuclei_path', 'nuclei 路径') + field(CFG, 'deep.ai_search', 'AI 扩展', 'checkbox') +
+    field(CFG, 'notification.webhook', 'Webhook') + field(CFG, 'notification.dingtalk', '钉钉机器人') +
+    field(CFG, 'notification.feishu', '飞书机器人') + field(CFG, 'notification.wecom', '企业微信机器人');
+}
+$('#saveCfg').onclick = async () => {
+  const patch = {};
+  $$('[data-path]').forEach((el) => {
+    const parts = el.dataset.path.split('.');
+    let node = patch;
+    parts.slice(0, -1).forEach((p) => { node = (node[p] = node[p] || {}); });
+    let v;
+    if (el.type === 'checkbox') v = el.checked;
+    else if (el.tagName === 'TEXTAREA') v = el.value.split('\n').map((x) => x.trim()).filter(Boolean);
+    else v = el.value;
+    node[parts[parts.length - 1]] = v;
+  });
+  try { const j = await api('/api/config', {method: 'POST', body: JSON.stringify(patch)});
+    CFG = j.config; toast('配置已保存'); await loadSources(); } catch (e) { toast(e.message); }
+};
+$('#testProxy').onclick = async () => {
+  const j = await api('/api/config/test', {method: 'POST', body: JSON.stringify({source: 'proxy'})});
+  toast('代理：' + (j.ok ? '可用 ' : '不可用 ') + (j.msg || ''));
+};
+window.testSource = async (name) => {
+  toast('测试 ' + name + ' …');
+  const j = await api('/api/config/test', {method: 'POST', body: JSON.stringify({source: name})});
+  toast(name + '：' + (j.ok ? '正常 ' : '失败 ') + (j.msg || ''));
+};
+
+// ───────── 审计 ─────────
+async function loadAudit() {
+  const j = await api('/api/audit?limit=200');
+  $('#auditList').innerHTML = (j.items || []).map((a) => `<tr>
+    <td class="mono">${esc(new Date(a.ts * 1000).toLocaleString())}</td><td>${esc(a.user)}</td>
+    <td>${esc(a.action)}</td><td class="mono">${esc(a.target)}</td>
+    <td class="mono">${esc((a.detail || '').slice(0, 120))}</td></tr>`).join('');
+}
+
+// ───────── 启动 ─────────
+(async function init() {
+  if (!TOKEN) { showLogin(); return; }
+  await boot();
+})();
+</script>
+</body>
+</html>

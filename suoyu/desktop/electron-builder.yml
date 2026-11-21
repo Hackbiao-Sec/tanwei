@@ -1,0 +1,26 @@
+appId: com.tianjian.suoyu
+productName: Suoyu Console
+copyright: TianJian Suoyu
+directories:
+  output: release
+  buildResources: build
+files:
+  - main.js
+  - preload.js
+  - package.json
+extraResources:
+  - from: ../dist/suoyu-server.exe
+    to: bin/suoyu-server.exe
+asar: true
+npmRebuild: false
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+  requestedExecutionLevel: asInvoker
+portable:
+  unicode: true
+  artifactName: SuoyuConsole-${version}-portable.${ext}
+  # 单文件运行：启动时解压到临时目录，退出后清理
+  splashImage: null

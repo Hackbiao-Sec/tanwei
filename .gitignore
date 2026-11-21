@@ -1,0 +1,8 @@
+# 系统与编辑器产生的垃圾（各系列自己的忽略规则放在各自目录）
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo

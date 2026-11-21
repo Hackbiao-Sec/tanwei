@@ -1,8 +1,31 @@
-# 系统与编辑器产生的垃圾（各系列自己的忽略规则放在各自目录）
+# 依赖与构建产物
+node_modules/
+out/
+release/
+release-v2/
+release-v3/
+release-v4/
+release-v5/
+release-next/
+release-public/
+dist/
+*.tsbuildinfo
+
+# 日志与临时文件
+*.log
+npm-debug.log*
+*.tmp
+
+# 打包内置的 grok 二进制（181 MB，不进仓库；用 npm run embed:grok 现场取）
+resources/grok/*
+!resources/grok/.gitkeep
+
+# 便携版运行时落在 exe 旁边的数据目录
+TanweiConsole-data/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
 desktop.ini
-.idea/
-.vscode/
-*.swp
-*.swo
